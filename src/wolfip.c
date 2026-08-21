@@ -11697,11 +11697,14 @@ static void flush_raw_tx(struct wolfIP *s)
                 struct wolfIP_ll_dev *loop = wolfIP_ll_at(s, tx_if);
                 if (loop)
                     memcpy(r->nexthop_mac, loop->mac, 6);
-            } else if ((!IS_IP_BCAST(nexthop) && (arp_lookup(s, tx_if, nexthop, r->nexthop_mac) < 0))) {
-                arp_request(s, tx_if, nexthop);
-                break;
-            } else if (IS_IP_BCAST(nexthop)) {
-                memset(r->nexthop_mac, 0xFF, 6);
+            } else if (!wolfIP_ll_is_non_ethernet(s, tx_if)) {
+                if (!IS_IP_BCAST(nexthop) &&
+                        (arp_lookup(s, tx_if, nexthop, r->nexthop_mac) < 0)) {
+                    arp_request(s, tx_if, nexthop);
+                    break;
+                } else if (IS_IP_BCAST(nexthop)) {
+                    memset(r->nexthop_mac, 0xFF, 6);
+                }
             }
 #else
             nexthop = dst_ip;
@@ -11713,9 +11716,13 @@ static void flush_raw_tx(struct wolfIP *s)
             if (wolfIP_filter_notify_ip(WOLFIP_FILT_SENDING, s, tx_if, ip, desc->len) != 0)
                 break;
 #ifdef ETHERNET
-            if (wolfIP_filter_notify_eth(WOLFIP_FILT_SENDING, s, tx_if, &ip->eth, desc->len) != 0)
-                break;
-            eth_output_add_header(s, tx_if, r->nexthop_mac, &ip->eth, ETH_TYPE_IP);
+            if (!wolfIP_ll_is_non_ethernet(s, tx_if)) {
+                if (wolfIP_filter_notify_eth(WOLFIP_FILT_SENDING, s, tx_if,
+                            &ip->eth, desc->len) != 0)
+                    break;
+                eth_output_add_header(s, tx_if, r->nexthop_mac, &ip->eth,
+                        ETH_TYPE_IP);
+            }
 #endif
             /* Mirror flush_datagram_tx: on driver backpressure/hard error
              * keep the descriptor at the FIFO head so the next poll retries
