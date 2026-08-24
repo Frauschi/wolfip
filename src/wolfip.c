@@ -8734,14 +8734,31 @@ static int dhcp_opt_stream_next(struct dhcp_opt_stream *st, uint8_t *code,
     while (1) {
         uint8_t c;
         uint8_t l;
-        if (st->ptr + 1 > st->end)
+        if (st->ptr + 1 > st->end) {
+            /* Field exhausted without an end option. */
+            if (st->strict && st->region == 0) {
+                /* RFC 2132 sec.3.2: the main options field must be
+                 * terminated by the end option; an end option found
+                 * later in an overloaded field must not satisfy the
+                 * main field's terminator. */
+                return -1;
+            }
             goto region_end;
+        }
         c = st->ptr[0];
         if (c == DHCP_OPTION_END) {
+            uint8_t *end_pos = st->ptr;
+            /* RFC 2132 sec.3.2: the end option marks the end of valid
+             * information in this field. If option 52 selected further
+             * overloaded fields, they are separate option lists
+             * (sec.9.3): skip this field's trailing pads and continue;
+             * only the final field's end option terminates the stream. */
+            st->ptr = st->end;
+            if (dhcp_opt_stream_next_region(st))
+                continue;
             *code = c;
             *len = 0;
-            *data = st->ptr;
-            st->ptr = st->end; /* stream ends here */
+            *data = end_pos;
             return 1;
         }
         if (c == 0) { /* Pad */

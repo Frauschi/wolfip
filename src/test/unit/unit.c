@@ -544,6 +544,9 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_utils, test_dhcp_parse_offer_option_overload);
     tcase_add_test(tc_utils,
                    test_dhcp_parse_offer_option_split_across_region_boundary_rejected);
+    tcase_add_test(tc_utils, test_dhcp_parse_offer_main_field_without_end_rejected);
+    tcase_add_test(tc_utils,
+                   test_dhcp_parse_offer_compliant_overloaded_offer_accepted);
     tcase_add_test(tc_utils, test_dhcp_discover_first_retry_delay_rfc2131);
     tcase_add_test(tc_utils, test_dhcp_discover_sets_broadcast_flag);
     tcase_add_test(tc_utils, test_dhcp_request_broadcast_flag_by_state);

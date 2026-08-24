@@ -3507,8 +3507,8 @@ START_TEST(test_dhcp_parse_offer_option_overload)
     s.dhcp_xid = 0x1234;
 
     /* --- Scenario 1: overload = sname (value 2) ---
-     * Options field: OFFER, mask, overload; no END — the stream
-     * continues into the sname field, which holds the server id. */
+     * Options field: OFFER, mask, overload, END; the server id is held
+     * in the sname field, a separate option list (RFC 2132 sec.9.3). */
     memset(&msg, 0, sizeof(msg));
     msg.op = BOOT_REPLY;
     msg.magic = ee32(DHCP_MAGIC);
@@ -3522,6 +3522,7 @@ START_TEST(test_dhcp_parse_offer_option_overload)
     opt += 6;
     opt[0] = 52 /* DHCP_OPTION_OVERLOAD */; opt[1] = 1; opt[2] = 2;
     opt += 3;
+    *opt++ = DHCP_OPTION_END;
     opt_len = (uint32_t)(opt - (uint8_t *)msg.options);
     field_opt = (struct dhcp_option *)msg.sname;
     field_opt->code = DHCP_OPTION_SERVER_ID;
@@ -3555,6 +3556,7 @@ START_TEST(test_dhcp_parse_offer_option_overload)
     opt += 3;
     opt[0] = 52 /* DHCP_OPTION_OVERLOAD */; opt[1] = 1; opt[2] = 1;
     opt += 3;
+    *opt++ = DHCP_OPTION_END;
     opt_len = (uint32_t)(opt - (uint8_t *)msg.options);
     field_opt = (struct dhcp_option *)msg.file;
     field_opt->code = DHCP_OPTION_SERVER_ID;
@@ -3569,9 +3571,9 @@ START_TEST(test_dhcp_parse_offer_option_overload)
     ck_assert_int_eq(ret, 0);
     ck_assert_uint_eq(s.dhcp_server_ip, 0x0A000064U);
 
-    /* --- Scenario 3: overload = both (value 3): the stream runs
-     * options -> sname -> file; the mask is in sname, the server id in
-     * file. */
+    /* --- Scenario 3: overload = both (value 3): the option lists run
+     * options (terminated by END) -> sname -> file; the mask is in
+     * sname, the server id in file. */
     memset(&s, 0, sizeof(s));
     wolfIP_init(&s);
     mock_link_init(&s);
@@ -3587,6 +3589,7 @@ START_TEST(test_dhcp_parse_offer_option_overload)
     opt += 3;
     opt[0] = 52 /* DHCP_OPTION_OVERLOAD */; opt[1] = 1; opt[2] = 3;
     opt += 3;
+    *opt++ = DHCP_OPTION_END;
     opt_len = (uint32_t)(opt - (uint8_t *)msg.options);
     field_opt = (struct dhcp_option *)msg.sname;
     field_opt->code = DHCP_OPTION_SUBNET_MASK;
@@ -3716,6 +3719,97 @@ START_TEST(test_dhcp_parse_offer_option_split_across_region_boundary_rejected)
     ret = dhcp_parse_offer(&s, &msg, DHCP_HEADER_LEN + opt_len);
     ck_assert_int_eq(ret, -1);
     ck_assert_uint_eq(s.dhcp_server_ip, 0U);
+}
+END_TEST
+
+/* F-11442: the main options field must be terminated by the end option
+ * (RFC 2132 sec.3.2). An end option found later in an overloaded field
+ * must not satisfy the main field's terminator: a main field that runs
+ * out before its end option is malformed and must be rejected in strict
+ * parsing, even if the remaining fields are well formed. */
+START_TEST(test_dhcp_parse_offer_main_field_without_end_rejected)
+{
+    struct wolfIP s;
+    struct dhcp_msg msg;
+    uint8_t *opt;
+    uint8_t *sn;
+    uint32_t opt_len;
+    int ret;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, 0x0A000001U, 0xFFFFFF00U, 0);
+    s.dhcp_xid = 0x1234;
+    memset(&msg, 0, sizeof(msg));
+    msg.op = BOOT_REPLY;
+    msg.magic = ee32(DHCP_MAGIC);
+    msg.xid = ee32(s.dhcp_xid);
+    msg.yiaddr = ee32(0x0A00000AU);
+    opt = (uint8_t *)msg.options;
+    opt[0] = DHCP_OPTION_MSG_TYPE; opt[1] = 1; opt[2] = DHCP_OFFER;
+    opt += 3;
+    opt[0] = 52 /* DHCP_OPTION_OVERLOAD */; opt[1] = 1; opt[2] = 2;
+    opt += 3;
+    opt[0] = DHCP_OPTION_SERVER_ID; opt[1] = 4;
+    opt[2] = 0x0A; opt[3] = 0x00; opt[4] = 0x00; opt[5] = 0x64;
+    opt += 6;
+    /* No END in the main options field. */
+    opt_len = (uint32_t)(opt - (uint8_t *)msg.options);
+    sn = (uint8_t *)msg.sname;
+    sn[0] = DHCP_OPTION_END; /* the only END, in the overloaded field */
+
+    ret = dhcp_parse_offer(&s, &msg, DHCP_HEADER_LEN + opt_len);
+    ck_assert_int_eq(ret, -1);
+}
+END_TEST
+
+/* F-11442: a conforming overloaded OFFER - main field terminated by
+ * its end option, the server id in the sname field's own option list -
+ * must be accepted: after the main field's end option the stream
+ * continues into the overloaded fields and the final field's end
+ * option terminates it. */
+START_TEST(test_dhcp_parse_offer_compliant_overloaded_offer_accepted)
+{
+    struct wolfIP s;
+    struct dhcp_msg msg;
+    struct dhcp_option *field_opt;
+    uint8_t *opt;
+    uint32_t opt_len;
+    int ret;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, 0x0A000001U, 0xFFFFFF00U, 0);
+    s.dhcp_xid = 0x1234;
+    memset(&msg, 0, sizeof(msg));
+    msg.op = BOOT_REPLY;
+    msg.magic = ee32(DHCP_MAGIC);
+    msg.xid = ee32(s.dhcp_xid);
+    msg.yiaddr = ee32(0x0A00000AU);
+    opt = (uint8_t *)msg.options;
+    opt[0] = DHCP_OPTION_MSG_TYPE; opt[1] = 1; opt[2] = DHCP_OFFER;
+    opt += 3;
+    opt[0] = DHCP_OPTION_SUBNET_MASK; opt[1] = 4;
+    opt[2] = 0xFF; opt[3] = 0xFF; opt[4] = 0xFF; opt[5] = 0x00;
+    opt += 6;
+    opt[0] = 52 /* DHCP_OPTION_OVERLOAD */; opt[1] = 1; opt[2] = 2;
+    opt += 3;
+    *opt++ = DHCP_OPTION_END; /* main field properly terminated */
+    opt_len = (uint32_t)(opt - (uint8_t *)msg.options);
+    field_opt = (struct dhcp_option *)msg.sname;
+    field_opt->code = DHCP_OPTION_SERVER_ID;
+    field_opt->len = 4;
+    field_opt->data[0] = 0x0A; field_opt->data[1] = 0x00;
+    field_opt->data[2] = 0x00; field_opt->data[3] = 0x64;
+    field_opt = (struct dhcp_option *)((uint8_t *)field_opt + 6);
+    field_opt->code = DHCP_OPTION_END;
+    field_opt->len = 0;
+
+    ret = dhcp_parse_offer(&s, &msg, DHCP_HEADER_LEN + opt_len);
+    ck_assert_int_eq(ret, 0);
+    ck_assert_uint_eq(s.dhcp_server_ip, 0x0A000064U);
+    ck_assert_uint_eq(s.dhcp_ip, 0x0A00000AU);
+    ck_assert_int_eq(s.dhcp_state, DHCP_REQUEST_SENT);
 }
 END_TEST
 START_TEST(test_fifo_push_and_pop) {
