@@ -2236,7 +2236,7 @@ static int     state_write_calls = 0;
 static uint32_t state_last_oseq = 0;
 
 static int state_test_read_cb(const uint8_t *spi, uint32_t *oseq,
-                              uint32_t *hi_seq, uint32_t *bitmap)
+                              uint32_t *hi_seq, uint64_t *bitmap)
 {
     state_read_calls++;
     if (memcmp(spi, state_test_spi, ESP_SPI_LEN) == 0) {
@@ -2248,7 +2248,7 @@ static int state_test_read_cb(const uint8_t *spi, uint32_t *oseq,
 }
 
 static int state_test_write_cb(const uint8_t *spi, uint32_t oseq,
-                               uint32_t hi_seq, uint32_t bitmap)
+                               uint32_t hi_seq, uint64_t bitmap)
 {
     state_write_calls++;
     if (memcmp(spi, state_test_spi, ESP_SPI_LEN) == 0) {
@@ -2273,7 +2273,7 @@ state_test_wire_seq(const struct wolfIP_ip_packet *ip)
 static uint8_t state_fail_spi[ESP_SPI_LEN] = {0x99, 0x88, 0x77, 0x66};
 
 static int state_fail_read_cb(const uint8_t *spi, uint32_t *oseq,
-                              uint32_t *hi_seq, uint32_t *bitmap)
+                              uint32_t *hi_seq, uint64_t *bitmap)
 {
     if (memcmp(spi, state_fail_spi, ESP_SPI_LEN) == 0) {
         *oseq   = 0xDEADBEEFU;
@@ -2316,6 +2316,99 @@ START_TEST(test_esp_state_restore_failed_read_keeps_fresh_state)
     wolfIP_esp_sa_del_all();
     ret = wolfIP_esp_state_set_cbs(NULL, NULL);
     ck_assert_int_eq(ret, 0);
+}
+END_TEST
+
+/* F-11440: the persistence callbacks must carry the full 64-bit replay
+ * bitmap. The old uint32_t callback types truncated bits 32..63 on save
+ * and reconstituted only the lower half on restore, so a duplicate in
+ * the upper half of the window was accepted after a restore. */
+static uint8_t  state_64bit_spi[ESP_SPI_LEN] = {0x55, 0x44, 0x33, 0x22};
+static uint32_t state64_oseq   = 0;
+static uint32_t state64_hi_seq = 0;
+static uint64_t state64_bitmap = 0;
+
+static int state64_read_cb(const uint8_t *spi, uint32_t *oseq,
+                           uint32_t *hi_seq, uint64_t *bitmap)
+{
+    if (memcmp(spi, state_64bit_spi, ESP_SPI_LEN) == 0) {
+        *oseq   = state64_oseq;
+        *hi_seq = state64_hi_seq;
+        *bitmap = state64_bitmap;
+        return 0;
+    }
+    return -1; /* unknown SPI: start fresh */
+}
+
+static int state64_write_cb(const uint8_t *spi, uint32_t oseq,
+                            uint32_t hi_seq, uint64_t bitmap)
+{
+    if (memcmp(spi, state_64bit_spi, ESP_SPI_LEN) == 0) {
+        state64_oseq   = oseq;
+        state64_hi_seq = hi_seq;
+        state64_bitmap = bitmap;
+    }
+    return 0;
+}
+
+START_TEST(test_esp_state_persistence_keeps_64bit_bitmap)
+{
+    int ret;
+    wolfIP_esp_sa *esp_sa;
+
+    esp_setup();
+    state64_oseq = 0;
+    state64_hi_seq = 0;
+    state64_bitmap = 0;
+
+    ret = wolfIP_esp_state_set_cbs(state64_write_cb, state64_read_cb);
+    ck_assert_int_eq(ret, 0);
+
+    ret = wolfIP_esp_sa_new_cbc_hmac(1, state_64bit_spi,
+                                     atoip4(T_SRC), atoip4(T_DST),
+                                     (uint8_t *)k_aes128, sizeof(k_aes128),
+                                     ESP_AUTH_SHA256_RFC4868,
+                                     (uint8_t *)k_auth16, sizeof(k_auth16),
+                                     ESP_ICVLEN_HMAC_128);
+    ck_assert_int_eq(ret, 0);
+    esp_sa = esp_sa_get(1, state_64bit_spi);
+    ck_assert_ptr_nonnull(esp_sa);
+
+    /* A window with a set bit in the upper half of the bitmap:
+     * hi_seq 100, seq 60 already accepted (bit 100-60 = 40). */
+    esp_sa->replay.oseq   = 7;
+    esp_sa->replay.hi_seq = 100;
+    esp_sa->replay.bitmap = (1ULL << 40) | 1ULL;
+
+    /* SA deletion is a save event: the write callback must receive the
+     * full 64-bit bitmap. */
+    wolfIP_esp_sa_del(1, state_64bit_spi);
+    ck_assert_uint_eq(state64_bitmap, (1ULL << 40) | 1ULL);
+    ck_assert_uint_eq(state64_hi_seq, 100U);
+    ck_assert_uint_eq(state64_oseq, 7U);
+
+    /* Recreating the SA must restore the full window, upper half
+     * included. */
+    ret = wolfIP_esp_sa_new_cbc_hmac(1, state_64bit_spi,
+                                     atoip4(T_SRC), atoip4(T_DST),
+                                     (uint8_t *)k_aes128, sizeof(k_aes128),
+                                     ESP_AUTH_SHA256_RFC4868,
+                                     (uint8_t *)k_auth16, sizeof(k_auth16),
+                                     ESP_ICVLEN_HMAC_128);
+    ck_assert_int_eq(ret, 0);
+    esp_sa = esp_sa_get(1, state_64bit_spi);
+    ck_assert_ptr_nonnull(esp_sa);
+    ck_assert_uint_eq(esp_sa->replay.bitmap, (1ULL << 40) | 1ULL);
+    ck_assert_uint_eq(esp_sa->replay.hi_seq, 100U);
+    ck_assert_uint_eq(esp_sa->replay.oseq, 7U);
+
+    /* The restored window must actually reject the upper-half duplicate
+     * (seq 60) and still accept new sequences. */
+    ck_assert_int_ne(esp_replay_check(&esp_sa->replay, 60U), 0);
+    ck_assert_int_eq(esp_replay_check(&esp_sa->replay, 101U), 0);
+
+    wolfIP_esp_sa_del_all();
+    wolfIP_esp_state_set_cbs(NULL, NULL);
 }
 END_TEST
 
@@ -2495,6 +2588,7 @@ static Suite *esp_suite(void)
     tcase_add_test(tc, test_sa_del_all);
     tcase_add_test(tc, test_esp_state_persistence_callbacks);
     tcase_add_test(tc, test_esp_state_restore_failed_read_keeps_fresh_state);
+    tcase_add_test(tc, test_esp_state_persistence_keeps_64bit_bitmap);
     suite_add_tcase(s, tc);
 
     /* Replay window */
