@@ -973,6 +973,95 @@ START_TEST(test_dhcp_parse_ack_no_mask_after_ack_rejected)
 }
 END_TEST
 
+/* F-11430: DHCP options are order-independent (RFC 2132). A valid
+ * DHCPACK carrying the server identifier, mask, router, and lease time
+ * before the message-type option must be accepted and committed. */
+START_TEST(test_dhcp_parse_ack_options_before_msg_type_accepted)
+{
+    struct wolfIP s;
+    struct dhcp_msg msg;
+    struct ipconf *primary;
+    uint8_t *p;
+    uint32_t server_ip = 0x0A000001U;
+    uint32_t client_ip = 0x0A000064U;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    s.dhcp_xid = 0xEE66U;
+    s.last_tick = 0U;
+    s.dhcp_state = DHCP_REQUEST_SENT;
+    s.dhcp_server_ip = server_ip;  /* committed during the OFFER phase */
+    primary = wolfIP_primary_ipconf(&s);
+    ck_assert_ptr_nonnull(primary);
+    primary->ip = client_ip;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.op = BOOT_REPLY;
+    msg.magic = ee32(DHCP_MAGIC);
+    msg.xid = ee32(s.dhcp_xid);
+    msg.yiaddr = ee32(client_ip);
+    p = (uint8_t *)msg.options;
+    /* Lease options before the message-type option. */
+    append_opt4(&p, DHCP_OPTION_SERVER_ID, server_ip);
+    append_opt4(&p, DHCP_OPTION_SUBNET_MASK, 0xFFFFFF00U);
+    append_opt4(&p, DHCP_OPTION_ROUTER, 0x0A000001U);
+    append_opt4(&p, DHCP_OPTION_LEASE_TIME, 3600U);
+    p[0] = DHCP_OPTION_MSG_TYPE; p[1] = 1; p[2] = DHCP_ACK; p += 3;
+    append_end(&p);
+
+    ck_assert_int_eq(dhcp_parse_ack(&s, &msg, sizeof(msg)), 0);
+    ck_assert_uint_eq(s.dhcp_server_ip, server_ip);
+    ck_assert_uint_eq(primary->ip, client_ip);
+    ck_assert_uint_eq(primary->mask, 0xFFFFFF00U);
+    ck_assert_uint_eq(primary->gw, 0x0A000001U);
+}
+END_TEST
+
+/* A server identifier that does not match the server committed during
+ * the OFFER phase is rejected wherever it appears in the stream: the
+ * ordering gate must not let a mismatched server-id before option 53
+ * slide past the check. */
+START_TEST(test_dhcp_parse_ack_mismatched_server_id_before_msg_type_rejected)
+{
+    struct wolfIP s;
+    struct dhcp_msg msg;
+    struct ipconf *primary;
+    uint8_t *p;
+    uint32_t server_ip = 0x0A000001U;   /* committed during the OFFER phase */
+    uint32_t client_ip = 0x0A000064U;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    s.dhcp_xid = 0xEE77U;
+    s.last_tick = 0U;
+    s.dhcp_state = DHCP_REQUEST_SENT;
+    s.dhcp_server_ip = server_ip;
+    primary = wolfIP_primary_ipconf(&s);
+    ck_assert_ptr_nonnull(primary);
+    primary->ip = client_ip;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.op = BOOT_REPLY;
+    msg.magic = ee32(DHCP_MAGIC);
+    msg.xid = ee32(s.dhcp_xid);
+    msg.yiaddr = ee32(client_ip);
+    p = (uint8_t *)msg.options;
+    /* Mismatched server id before the message-type option, then a fully
+     * valid ACK (matching server id + all mandatory fields). */
+    append_opt4(&p, DHCP_OPTION_SERVER_ID, 0x0A000099U);
+    p[0] = DHCP_OPTION_MSG_TYPE; p[1] = 1; p[2] = DHCP_ACK; p += 3;
+    append_opt4(&p, DHCP_OPTION_SERVER_ID, server_ip);
+    append_opt4(&p, DHCP_OPTION_SUBNET_MASK, 0xFFFFFF00U);
+    append_opt4(&p, DHCP_OPTION_ROUTER, 0x0A000001U);
+    append_opt4(&p, DHCP_OPTION_LEASE_TIME, 3600U);
+    append_end(&p);
+
+    ck_assert_int_eq(dhcp_parse_ack(&s, &msg, sizeof(msg)), -1);
+    /* Nothing committed: the interface keeps its pre-ACK configuration. */
+    ck_assert_uint_eq(s.dhcp_state, DHCP_REQUEST_SENT);
+}
+END_TEST
+
 START_TEST(test_dhcp_parse_ack_with_renewal_and_rebind_times)
 {
     /* Happy path: ACK with T1 (renewal) and T2 (rebind) options set. */

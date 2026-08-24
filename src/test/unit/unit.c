@@ -1456,6 +1456,8 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_core, test_dhcp_parse_ack_rebind_time_len_lt4_rejected);
     tcase_add_test(tc_core, test_dhcp_parse_ack_no_ip_after_ack_rejected);
     tcase_add_test(tc_core, test_dhcp_parse_ack_no_mask_after_ack_rejected);
+    tcase_add_test(tc_core, test_dhcp_parse_ack_options_before_msg_type_accepted);
+    tcase_add_test(tc_core, test_dhcp_parse_ack_mismatched_server_id_before_msg_type_rejected);
     tcase_add_test(tc_core, test_dhcp_parse_ack_with_renewal_and_rebind_times);
     tcase_add_test(tc_core, test_dhcp_parse_ack_dns_already_set_skipped);
     tcase_add_test(tc_core, test_dhcp_parse_ack_inner_pad_bytes_skipped);

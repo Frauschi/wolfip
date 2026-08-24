@@ -8961,6 +8961,7 @@ static int dhcp_parse_ack(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg_l
     struct dhcp_opt_stream st;
     int saw_end = 0;
     int saw_server_id = 0;
+    int msg_type = 0;
     struct ipconf *primary = wolfIP_primary_ipconf(s);
     uint32_t lease_ip = 0;
     uint32_t lease_mask = 0;
@@ -8987,6 +8988,9 @@ static int dhcp_parse_ack(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg_l
         return -1;
     if (ee32(msg->xid) != s->dhcp_xid)
         return -1;
+    /* RFC 2132: options are order-independent. Collect the fields in one
+     * pass regardless of order and validate the message type and the
+     * mandatory lease fields at the end of the stream. */
     dhcp_opt_stream_init(&st, msg, msg_len, 1);
     while (1) {
         uint8_t code;
@@ -9004,126 +9008,121 @@ static int dhcp_parse_ack(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg_l
         if (code == DHCP_OPTION_MSG_TYPE) {
             if (len != 1)
                 return -1;
-            if (data[2] == DHCP_ACK) {
-                while (1) {
-                    uint8_t *idata;
-                    uint32_t val;
-                    r = dhcp_opt_stream_next(&st, &code, &len, &idata);
-                    if (r < 0)
-                        return -1;
-                    if (r == 0)
-                        break;
-                    if (code == DHCP_OPTION_END) {
-                        saw_end = 1;
-                        break;
-                    }
-                    if (code == DHCP_OPTION_SERVER_ID) {
-                        if (len < 4)
-                            return -1;
-                        val = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                        /* Reject ACK from a server other than the one
-                         * we committed to during the OFFER phase. */
-                        if (s->dhcp_server_ip != 0 && val != s->dhcp_server_ip)
-                            return -1;
-                        cand_server_ip = val;
-                        saw_server_id = 1;
-                    } else if (code == DHCP_OPTION_OFFER_IP) {
-                        if (len < 4)
-                            return -1;
-                        cand_ip = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                        have_ip = 1;
-                    } else if (primary && code == DHCP_OPTION_SUBNET_MASK) {
-                        if (len < 4)
-                            return -1;
-                        cand_mask = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                        have_mask = 1;
-                    } else if (primary && code == DHCP_OPTION_ROUTER) {
-                        if (len < 4)
-                            return -1;
-                        cand_gw = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                        have_gw = 1;
-                    } else if ((code == DHCP_OPTION_DNS) && (s->dns_server == 0)) {
-                        if (len < 4)
-                            return -1;
-                        if (cand_dns == 0)
-                            cand_dns = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                    } else if (code == DHCP_OPTION_LEASE_TIME) {
-                        if (len < 4)
-                            return -1;
-                        lease_s = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                    } else if (code == DHCP_OPTION_RENEWAL_TIME) {
-                        if (len < 4)
-                            return -1;
-                        renew_s = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                    } else if (code == DHCP_OPTION_REBIND_TIME) {
-                        if (len < 4)
-                            return -1;
-                        rebind_s = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                    }
-                }
-                if (!saw_end)
-                    return -1;
-                /* The lease address is option 50 (the requested IP) when the
-                 * server echoes it, otherwise the yiaddr it committed; either
-                 * way it must be a usable unicast address before it is applied
-                 * to the interface. The netmask is the ACK's when it carries
-                 * one, else the interface's current mask, else the one
-                 * recorded during the OFFER phase. Both are effective values
-                 * computed here, never written until the commit below. */
-                lease_ip = have_ip ? cand_ip : ee32(msg->yiaddr);
-                lease_mask = have_mask ? cand_mask
-                            : ((primary && primary->mask != 0)
-                               ? primary->mask : s->dhcp_offered_mask);
-                /* RFC 2131: the IP-address-lease-time option (51) is mandatory
-                 * in a DHCPACK. lease_s is only ever set by that option (and a
-                 * short option already returns -1 above), so lease_s != 0 means
-                 * it was present with a valid nonzero duration. Without it the
-                 * lease would be bound with no expiry/renewal timer. */
-                if (primary && saw_server_id && lease_s != 0 &&
-                    (lease_mask != 0) &&
-                    dhcp_lease_ip_sane(lease_ip, lease_mask)) {
-                    /* Commit the validated configuration atomically. */
-                    s->dhcp_server_ip = cand_server_ip;
-                    primary->ip = lease_ip;
-                    primary->mask = lease_mask;
-                    if (have_gw)
-                        primary->gw = cand_gw;
-                    if (s->dns_server == 0 && cand_dns != 0)
-                        s->dns_server = cand_dns;
-                    dhcp_cancel_timer(s);
-                    s->dhcp_ip = primary->ip;
-#ifdef ETHERNET
-                    /* RFC 4331: probe the address before using it. The
-                     * lease timers are armed now so they are in place when
-                     * the probes complete; the short DAD timer overrides
-                     * them until then. A conflicting answer is detected in
-                     * arp_recv (dhcp_dad_conflict). */
-                    s->dhcp_state = DHCP_DAD;
-                    s->dhcp_dad_probes = 0;
-                    /* Arm the lease absolutes, then swap the renew timer for
-                     * the DAD timer: handle_timers() fires every expired
-                     * entry, so leaving both in the heap would double-fire
-                     * the renew. The absolutes survive; the DAD completion
-                     * re-arms the renew timer. */
-                    dhcp_schedule_lease_timer(s, lease_s, renew_s, rebind_s);
-                    timer_binheap_cancel(&s->timers, s->dhcp_timer);
-                    s->dhcp_timer = NO_TIMER;
-                    /* ll drivers return the frame length (>= 0) on
-                     * success, not 0; only count the probe when it
-                     * actually went out. */
-                    if (dhcp_send_dad_probe(s) >= 0)
-                        s->dhcp_dad_probes = 1;
-                    dhcp_schedule_timer_at(s,
-                            s->last_tick + DHCP_DAD_INTERVAL_MS);
-#else
-                    s->dhcp_state = DHCP_BOUND;
-                    dhcp_schedule_lease_timer(s, lease_s, renew_s, rebind_s);
-#endif
-                    return 0;
-                }
-            }
-            break; /* the message type was seen; nothing else to scan */
+            msg_type = data[2];
         }
+        else if (code == DHCP_OPTION_SERVER_ID) {
+            uint32_t val;
+            if (len < 4)
+                return -1;
+            val = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+            /* Reject ACK from a server other than the one we committed to
+             * during the OFFER phase, wherever the option appears. */
+            if (s->dhcp_server_ip != 0 && val != s->dhcp_server_ip)
+                return -1;
+            cand_server_ip = val;
+            saw_server_id = 1;
+        }
+        else if (code == DHCP_OPTION_OFFER_IP) {
+            if (len < 4)
+                return -1;
+            cand_ip = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+            have_ip = 1;
+        }
+        else if (primary && code == DHCP_OPTION_SUBNET_MASK) {
+            if (len < 4)
+                return -1;
+            cand_mask = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+            have_mask = 1;
+        }
+        else if (primary && code == DHCP_OPTION_ROUTER) {
+            if (len < 4)
+                return -1;
+            cand_gw = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+            have_gw = 1;
+        }
+        else if ((code == DHCP_OPTION_DNS) && (s->dns_server == 0)) {
+            if (len < 4)
+                return -1;
+            if (cand_dns == 0)
+                cand_dns = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+        }
+        else if (code == DHCP_OPTION_LEASE_TIME) {
+            if (len < 4)
+                return -1;
+            lease_s = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+        }
+        else if (code == DHCP_OPTION_RENEWAL_TIME) {
+            if (len < 4)
+                return -1;
+            renew_s = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+        }
+        else if (code == DHCP_OPTION_REBIND_TIME) {
+            if (len < 4)
+                return -1;
+            rebind_s = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+        }
+    }
+    if (!saw_end)
+        return -1;
+    if (msg_type != DHCP_ACK)
+        return -1;
+    /* The lease address is option 50 (the requested IP) when the
+     * server echoes it, otherwise the yiaddr it committed; either
+     * way it must be a usable unicast address before it is applied
+     * to the interface. The netmask is the ACK's when it carries
+     * one, else the interface's current mask, else the one
+     * recorded during the OFFER phase. Both are effective values
+     * computed here, never written until the commit below. */
+    lease_ip = have_ip ? cand_ip : ee32(msg->yiaddr);
+    lease_mask = have_mask ? cand_mask
+                : ((primary && primary->mask != 0)
+                   ? primary->mask : s->dhcp_offered_mask);
+    /* RFC 2131: the IP-address-lease-time option (51) is mandatory
+     * in a DHCPACK. lease_s is only ever set by that option (and a
+     * short option already returns -1 above), so lease_s != 0 means
+     * it was present with a valid nonzero duration. Without it the
+     * lease would be bound with no expiry/renewal timer. */
+    if (primary && saw_server_id && lease_s != 0 &&
+        (lease_mask != 0) &&
+        dhcp_lease_ip_sane(lease_ip, lease_mask)) {
+        /* Commit the validated configuration atomically. */
+        s->dhcp_server_ip = cand_server_ip;
+        primary->ip = lease_ip;
+        primary->mask = lease_mask;
+        if (have_gw)
+            primary->gw = cand_gw;
+        if (s->dns_server == 0 && cand_dns != 0)
+            s->dns_server = cand_dns;
+        dhcp_cancel_timer(s);
+        s->dhcp_ip = primary->ip;
+#ifdef ETHERNET
+        /* RFC 4331: probe the address before using it. The
+         * lease timers are armed now so they are in place when
+         * the probes complete; the short DAD timer overrides
+         * them until then. A conflicting answer is detected in
+         * arp_recv (dhcp_dad_conflict). */
+        s->dhcp_state = DHCP_DAD;
+        s->dhcp_dad_probes = 0;
+        /* Arm the lease absolutes, then swap the renew timer for
+         * the DAD timer: handle_timers() fires every expired
+         * entry, so leaving both in the heap would double-fire
+         * the renew. The absolutes survive; the DAD completion
+         * re-arms the renew timer. */
+        dhcp_schedule_lease_timer(s, lease_s, renew_s, rebind_s);
+        timer_binheap_cancel(&s->timers, s->dhcp_timer);
+        s->dhcp_timer = NO_TIMER;
+        /* ll drivers return the frame length (>= 0) on
+         * success, not 0; only count the probe when it
+         * actually went out. */
+        if (dhcp_send_dad_probe(s) >= 0)
+            s->dhcp_dad_probes = 1;
+        dhcp_schedule_timer_at(s,
+                s->last_tick + DHCP_DAD_INTERVAL_MS);
+#else
+        s->dhcp_state = DHCP_BOUND;
+        dhcp_schedule_lease_timer(s, lease_s, renew_s, rebind_s);
+#endif
+        return 0;
     }
     return -1;
 }
