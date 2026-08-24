@@ -2577,6 +2577,49 @@ static int timers_binheap_insert(struct timers_binheap *heap, struct wolfIP_time
     return tmr.id;
 }
 
+/* The app tick source may be a 32-bit counter that the stack keeps
+ * zero-extended in 64-bit fields. When the source wraps (or restarts from
+ * a lower value), a plain 64-bit comparison against a pending deadline
+ * stalls until the clock lapses the old value. Compare in the source's
+ * 32-bit domain with a signed difference (RFC 1982, the same convention
+ * as the tcp_seq_* helpers): for two values within half a counter period
+ * (~24.8 days at a 1 ms tick) the sign of the modular difference is the
+ * true temporal order, which is exact for a wrapping 32-bit source and
+ * fine for any 64-bit source whose pending deadlines sit within half a
+ * 32-bit period of now. */
+static inline int tick_expired(uint64_t expires, uint64_t now)
+{
+    return (int32_t)((uint32_t)expires - (uint32_t)now) <= 0;
+}
+
+/* Move an absolute deadline from the old tick domain into the current
+ * 32-bit source domain after a rollback. A deadline already due in the
+ * new domain is clamped to fire on this poll (tick 1 when now == 0, since
+ * expires == 0 is the heap's cancelled sentinel). */
+static inline uint64_t tick_rebase(uint64_t abs, uint64_t now)
+{
+    uint32_t v = (uint32_t)abs;
+
+    if (tick_expired(v, now))
+        return (now != 0) ? now : 1;
+    return v;
+}
+
+/* Rebase the pending timer heap after a tick-source rollback (see
+ * wolfIP_poll). Every live timer expires strictly after s->last_tick, so
+ * for a realistic wrap (old tick near 2^32, new tick small) the rebased
+ * values land in [now, now + max delay] and preserve min-heap order - no
+ * re-heapify needed. */
+static void timers_heap_rebase(struct timers_binheap *heap, uint64_t now)
+{
+    uint32_t i;
+
+    for (i = 0; i < heap->size; i++) {
+        if (heap->timers[i].expires != 0)
+            heap->timers[i].expires = tick_rebase(heap->timers[i].expires, now);
+    }
+}
+
 static int is_timer_expired(struct timers_binheap *heap, uint64_t now)
 {
     while (heap->size > 0 && heap->timers[0].expires == 0) {
@@ -2585,7 +2628,7 @@ static int is_timer_expired(struct timers_binheap *heap, uint64_t now)
     if (heap->size == 0) {
         return 0;
     }
-    return (heap->timers[0].expires <= now)?1:0;
+    return tick_expired(heap->timers[0].expires, now);
 }
 
 /* Restore the min-heap property after the element at index i was replaced
@@ -11789,19 +11832,36 @@ int wolfIP_poll(struct wolfIP *s, uint64_t now)
     if (!s)
         return -WOLFIP_EINVAL;
 
-#ifdef ETHERNET
     if (now < s->last_tick) {
-        unsigned int i;
         /* The tick source restarted from a lower value (e.g. the app
-         * handed off from a bare-metal tick loop to an RTOS tick). Absolute
-         * tick values from the previous domain are no longer comparable,
-         * so reset the ARP rate limit: otherwise a stale last_arp from the
-         * old domain holds the first request in the new domain for the
-         * whole stale offset. */
-        for (i = 0; i < s->if_count; i++)
-            s->arp.last_arp[i] = 0;
-    }
+         * handed off from a bare-metal tick loop to an RTOS tick, or a
+         * 32-bit source wrapped around). Absolute tick values from the
+         * previous domain are no longer comparable, so rebase pending
+         * deadlines into the new domain: timers keep their remaining time
+         * (or fire on this poll if already due) instead of stalling until
+         * the restarted clock lapses the old absolute expiries. */
+        timers_heap_rebase(&s->timers, now);
+        if (s->dhcp_renew_at != 0)
+            s->dhcp_renew_at = tick_rebase(s->dhcp_renew_at, now);
+        if (s->dhcp_rebind_at != 0)
+            s->dhcp_rebind_at = tick_rebase(s->dhcp_rebind_at, now);
+        if (s->dhcp_lease_expires != 0)
+            s->dhcp_lease_expires = tick_rebase(s->dhcp_lease_expires, now);
+        /* The in-flight acquisition start is re-timed in the new domain
+         * so elapsed-time math never compares across domains. */
+        s->dhcp_start_tick = now;
+#ifdef ETHERNET
+        {
+            unsigned int i;
+
+            /* Also reset the ARP rate limit: otherwise a stale last_arp
+             * from the old domain holds the first request in the new
+             * domain for the whole stale offset. */
+            for (i = 0; i < s->if_count; i++)
+                s->arp.last_arp[i] = 0;
+        }
 #endif
+    }
 
     s->last_tick = now;
 

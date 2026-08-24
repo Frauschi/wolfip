@@ -176,6 +176,9 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_utils, test_wolfip_dns_server_get_returns_value_and_validates_args);
     tcase_add_test(tc_utils, test_wolfip_poll_executes_timers_and_callbacks);
     tcase_add_test(tc_utils, test_wolfip_poll_drains_all_expired_timers_in_one_pass);
+    tcase_add_test(tc_utils, test_wolfip_poll_tick_wrap_timer_due_after_wrap);
+    tcase_add_test(tc_utils, test_wolfip_poll_tick_wrap_timer_already_due_fires_now);
+    tcase_add_test(tc_utils, test_wolfip_poll_tick_wrap_mixed_timer_ordering);
     tcase_add_test(tc_utils, test_wolfip_poll_preserves_tcp_events_raised_during_callback);
     tcase_add_test(tc_utils, test_wolfip_poll_limits_device_drain_to_poll_budget);
     tcase_add_test(tc_utils, test_filter_notify_tcp_metadata);
@@ -254,6 +257,7 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_utils, test_sock_accept_negative_fd);
     tcase_add_test(tc_utils, test_sock_accept_invalid_tcp_fd);
     tcase_add_test(tc_utils, test_sock_accept_success_sets_addr);
+    tcase_add_test(tc_utils, test_sock_accept_listener_resets_paws_state);
     tcase_add_test(tc_utils, test_sock_accept_no_available_socket);
     tcase_add_test(tc_utils, test_sock_accept_no_free_socket_syn_rcvd);
     tcase_add_test(tc_utils, test_sock_accept_listen_no_connection);

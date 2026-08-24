@@ -111,6 +111,120 @@ START_TEST(test_wolfip_poll_drains_all_expired_timers_in_one_pass)
 }
 END_TEST
 
+START_TEST(test_wolfip_poll_tick_wrap_timer_due_after_wrap)
+{
+    struct wolfIP s;
+    struct wolfIP_timer tmr;
+    uint64_t old_tick = 0xFFFFF000ULL; /* 4096 ticks before the 2^32 wrap */
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    timer_cb_calls = 0;
+
+    (void)wolfIP_poll(&s, old_tick);
+
+    /* Due 5000 ticks after the last poll: 904 ticks past the wrap point. */
+    memset(&tmr, 0, sizeof(tmr));
+    tmr.cb = test_timer_cb;
+    tmr.expires = old_tick + 5000;
+    (void)timers_binheap_insert(&s.timers, tmr);
+    ck_assert_uint_eq(s.timers.size, 1U);
+    ck_assert_uint_eq(s.timers.timers[0].expires, old_tick + 5000);
+    ck_assert_uint_eq(s.last_tick, old_tick);
+
+    /* The 32-bit source wraps: ... 0xFFFFF000 -> 0 -> ... -> 0x100.
+     * Without the rebase the deadline stays at 0x100000388 and the timer
+     * stalls for the rest of the counter period. */
+    (void)wolfIP_poll(&s, 0x100);
+    ck_assert_int_eq(timer_cb_calls, 0);
+
+    (void)wolfIP_poll(&s, 903);
+    ck_assert_int_eq(timer_cb_calls, 0);
+
+    (void)wolfIP_poll(&s, 904);
+    ck_assert_int_eq(timer_cb_calls, 1);
+    ck_assert_uint_eq(s.timers.size, 0U);
+}
+END_TEST
+
+START_TEST(test_wolfip_poll_tick_wrap_timer_already_due_fires_now)
+{
+    struct wolfIP s;
+    struct wolfIP_timer tmr;
+    uint64_t old_tick = 0xFFFFF000ULL;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    timer_cb_calls = 0;
+
+    (void)wolfIP_poll(&s, old_tick);
+
+    /* Due 3000 ticks after the last poll: 1096 ticks before the wrap
+     * point, so it is already overdue when the post-wrap poll arrives. */
+    memset(&tmr, 0, sizeof(tmr));
+    tmr.cb = test_timer_cb;
+    tmr.expires = old_tick + 3000;
+    (void)timers_binheap_insert(&s.timers, tmr);
+
+    (void)wolfIP_poll(&s, 0x100);
+
+    /* An overdue deadline must fire on the first poll of the new domain,
+     * not stall until the clock lapses the old absolute value. */
+    ck_assert_int_eq(timer_cb_calls, 1);
+    ck_assert_uint_eq(s.timers.size, 0U);
+}
+END_TEST
+
+START_TEST(test_wolfip_poll_tick_wrap_mixed_timer_ordering)
+{
+    struct wolfIP s;
+    struct wolfIP_timer tmr;
+    uint64_t old_tick = 0xFFFFF000ULL;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    timer_cb_calls = 0;
+
+    (void)wolfIP_poll(&s, old_tick);
+
+    /* Two old-domain deadlines: one due before the wrap (overdue at the
+     * post-wrap poll), one due 1404 ticks past it. */
+    memset(&tmr, 0, sizeof(tmr));
+    tmr.cb = test_timer_cb;
+    tmr.expires = old_tick + 3000;
+    (void)timers_binheap_insert(&s.timers, tmr);
+
+    memset(&tmr, 0, sizeof(tmr));
+    tmr.cb = test_timer_cb;
+    tmr.expires = old_tick + 5500;
+    (void)timers_binheap_insert(&s.timers, tmr);
+
+    /* Only the overdue one fires on the post-wrap poll; the other keeps
+     * its 1404-tick position in the new domain. */
+    (void)wolfIP_poll(&s, 0x100);
+    ck_assert_int_eq(timer_cb_calls, 1);
+
+    /* A timer armed in the new domain interleaves with the rebased one. */
+    memset(&tmr, 0, sizeof(tmr));
+    tmr.cb = test_timer_cb;
+    tmr.expires = s.last_tick + 100;
+    (void)timers_binheap_insert(&s.timers, tmr);
+
+    (void)wolfIP_poll(&s, 355);
+    ck_assert_int_eq(timer_cb_calls, 1);
+
+    (void)wolfIP_poll(&s, 356);
+    ck_assert_int_eq(timer_cb_calls, 2);
+
+    (void)wolfIP_poll(&s, 1403);
+    ck_assert_int_eq(timer_cb_calls, 2);
+
+    (void)wolfIP_poll(&s, 1404);
+    ck_assert_int_eq(timer_cb_calls, 3);
+    ck_assert_uint_eq(s.timers.size, 0U);
+}
+END_TEST
+
 START_TEST(test_wolfip_poll_preserves_tcp_events_raised_during_callback)
 {
     struct wolfIP s;
@@ -2368,6 +2482,126 @@ START_TEST(test_sock_accept_success_sets_addr)
     ck_assert_int_gt(client_sd, 0);
     ck_assert_uint_eq(alen, sizeof(sin));
     ck_assert_uint_eq(sin.sin_family, AF_INET);
+}
+END_TEST
+
+/* Inject a SYN carrying MSS + timestamp options from src_ip; ts_val is
+ * the peer timestamp that seeds the half-open listener's TS.Recent. */
+static void inject_tcp_syn_ts(struct wolfIP *s, unsigned int if_idx,
+        ip4 src_ip, ip4 dst_ip, uint16_t dst_port, uint32_t ts_val)
+{
+    uint8_t buf[sizeof(struct wolfIP_tcp_seg) +
+            sizeof(struct tcp_opt_mss) + sizeof(struct tcp_opt_ts)];
+    struct wolfIP_tcp_seg *syn = (struct wolfIP_tcp_seg *)buf;
+    struct wolfIP_ll_dev *ll = wolfIP_getdev_ex(s, if_idx);
+    union transport_pseudo_header ph;
+    struct tcp_opt_mss *mss;
+    struct tcp_opt_ts *tsopt;
+    static const uint8_t src_mac[6] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60};
+
+    ck_assert_ptr_nonnull(ll);
+    memset(buf, 0, sizeof(buf));
+    memcpy(syn->ip.eth.dst, ll->mac, 6);
+    memcpy(syn->ip.eth.src, src_mac, 6);
+    syn->ip.eth.type = ee16(ETH_TYPE_IP);
+    syn->ip.ver_ihl = 0x45;
+    syn->ip.ttl = 64;
+    syn->ip.proto = WI_IPPROTO_TCP;
+    syn->ip.len = ee16(IP_HEADER_LEN + TCP_HEADER_LEN +
+            (uint16_t)(sizeof(struct tcp_opt_mss) + sizeof(struct tcp_opt_ts)));
+    syn->ip.src = ee32(src_ip);
+    syn->ip.dst = ee32(dst_ip);
+    syn->ip.csum = 0;
+    iphdr_set_checksum(&syn->ip);
+
+    syn->src_port = ee16(40000);
+    syn->dst_port = ee16(dst_port);
+    syn->seq = ee32(1);
+    syn->ack = 0;
+    syn->hlen = (uint8_t)((TCP_HEADER_LEN + sizeof(struct tcp_opt_mss) +
+            sizeof(struct tcp_opt_ts)) / 4);
+    syn->flags = TCP_FLAG_SYN;
+    syn->win = ee16(65535);
+    syn->csum = 0;
+    syn->urg = 0;
+
+    mss = (struct tcp_opt_mss *)syn->data;
+    mss->opt = TCP_OPTION_MSS;
+    mss->len = TCP_OPTION_MSS_LEN;
+    mss->mss = ee16(1460);
+    tsopt = (struct tcp_opt_ts *)(syn->data + sizeof(struct tcp_opt_mss));
+    tsopt->opt = TCP_OPTION_TS;
+    tsopt->len = TCP_OPTION_TS_LEN;
+    tsopt->val = ee32(ts_val);
+    tsopt->ecr = 0;
+    tsopt->pad = TCP_OPTION_NOP;
+    tsopt->eoo = TCP_OPTION_NOP;
+
+    memset(&ph, 0, sizeof(ph));
+    ph.ph.src = syn->ip.src;
+    ph.ph.dst = syn->ip.dst;
+    ph.ph.proto = WI_IPPROTO_TCP;
+    ph.ph.len = ee16(TCP_HEADER_LEN + sizeof(struct tcp_opt_mss) +
+            sizeof(struct tcp_opt_ts));
+    syn->csum = ee16(transport_checksum(&ph, &syn->src_port));
+
+    tcp_input(s, if_idx, syn,
+            sizeof(struct wolfIP_eth_frame) + IP_HEADER_LEN + TCP_HEADER_LEN +
+            sizeof(struct tcp_opt_mss) + sizeof(struct tcp_opt_ts));
+}
+
+START_TEST(test_sock_accept_listener_resets_paws_state)
+{
+    struct wolfIP s;
+    int listen_sd;
+    struct tsocket *listener;
+    struct wolfIP_sockaddr_in sin;
+    socklen_t alen = sizeof(sin);
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, 0x0A000001U, 0xFFFFFF00U, 0);
+
+    listen_sd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_STREAM, WI_IPPROTO_TCP);
+    ck_assert_int_gt(listen_sd, 0);
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(1234);
+    sin.sin_addr.s_addr = ee32(0x0A000001U);
+    ck_assert_int_eq(wolfIP_sock_bind(&s, listen_sd, (struct wolfIP_sockaddr *)&sin, sizeof(sin)), 0);
+    ck_assert_int_eq(wolfIP_sock_listen(&s, listen_sd, 1), 0);
+
+    listener = &s.tcpsockets[SOCKET_UNMARK(listen_sd)];
+
+    /* Connection 1: the timestamped SYN seeds the half-open listener's
+     * TS.Recent (last_ts/ts_recent_valid) and enables PAWS. */
+    inject_tcp_syn_ts(&s, TEST_PRIMARY_IF, 0x0A0000A1U, 0x0A000001U, 1234,
+            0x10000000U);
+    ck_assert_int_eq(listener->sock.tcp.state, TCP_SYN_RCVD);
+    ck_assert_uint_eq(listener->sock.tcp.ts_enabled, 1);
+    ck_assert_uint_eq(listener->sock.tcp.last_ts, 0x10000000U);
+    ck_assert_uint_eq(listener->sock.tcp.ts_recent_valid, 1);
+
+    wolfIP_sock_accept(&s, listen_sd, (struct wolfIP_sockaddr *)&sin, &alen);
+    ck_assert_int_eq(listener->sock.tcp.state, TCP_LISTEN);
+
+    /* The reused listener must be back to a fresh baseline: the partial
+     * reset left connection 1's PAWS state (last_ts/ts_enabled/
+     * ts_recent_valid) on the port, so the next connection whose
+     * timestamps sit below the retained value inherits the stale
+     * TS.Recent and has its timestamped traffic dropped by PAWS. */
+    ck_assert_uint_eq(listener->sock.tcp.ts_enabled, 0);
+    ck_assert_uint_eq(listener->sock.tcp.ts_recent_valid, 0);
+    ck_assert_uint_eq(listener->sock.tcp.last_ts, 0U);
+
+    /* Connection 2, from a client with a lower timestamp epoch, must seed
+     * a fresh TS.Recent instead of inheriting connection 1's. */
+    inject_tcp_syn_ts(&s, TEST_PRIMARY_IF, 0x0A0000A2U, 0x0A000001U, 1234,
+            100U);
+    ck_assert_int_eq(listener->sock.tcp.state, TCP_SYN_RCVD);
+    ck_assert_uint_eq(listener->sock.tcp.ts_enabled, 1);
+    ck_assert_uint_eq(listener->sock.tcp.last_ts, 100U);
+    ck_assert_uint_eq(listener->sock.tcp.ts_recent_valid, 1);
 }
 END_TEST
 
