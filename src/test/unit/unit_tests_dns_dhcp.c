@@ -3612,11 +3612,17 @@ START_TEST(test_dhcp_parse_offer_option_overload)
 }
 END_TEST
 
-/* An option split across a region boundary is a continuation of the
- * option stream (RFC 2132 §9.3), not the start of a new option list:
- * the server id must be parsed across the split in each boundary
- * shape. */
-START_TEST(test_dhcp_parse_offer_option_split_across_region_boundary)
+/* F-11441: an option whose header or data crosses a field boundary is
+ * malformed, not a continuation of the option stream. RFC 2132
+ * sec.3.2 makes the end option the terminator of each field's valid
+ * information and sec.9.3 has the client interpret the overloaded
+ * fields only after concluding interpretation of the standard option
+ * fields - each field is a separate option list. Strict parsing must
+ * reject the split in each boundary shape; nothing may be committed.
+ * (The earlier reading that treated the fields as one continuous byte
+ * stream misread sec.9.3 and let a hostile server assemble arbitrary
+ * option bytes out of the field boundary.) */
+START_TEST(test_dhcp_parse_offer_option_split_across_region_boundary_rejected)
 {
     struct wolfIP s;
     struct dhcp_msg msg;
@@ -3627,7 +3633,7 @@ START_TEST(test_dhcp_parse_offer_option_split_across_region_boundary)
     int ret;
 
     /* --- Scenario 1: the server id's code byte is the last byte of
-     * the options field; its length, data and END continue in sname. --- */
+     * the options field; its length and data continue in sname. --- */
     wolfIP_init(&s);
     mock_link_init(&s);
     wolfIP_ipconfig_set(&s, 0x0A000001U, 0xFFFFFF00U, 0);
@@ -3650,10 +3656,8 @@ START_TEST(test_dhcp_parse_offer_option_split_across_region_boundary)
     sn[5] = DHCP_OPTION_END;
 
     ret = dhcp_parse_offer(&s, &msg, DHCP_HEADER_LEN + opt_len);
-    ck_assert_int_eq(ret, 0);
-    ck_assert_uint_eq(s.dhcp_server_ip, 0x0A000064U);
-    ck_assert_uint_eq(s.dhcp_ip, 0x0A00000AU);
-    ck_assert_int_eq(s.dhcp_state, DHCP_REQUEST_SENT);
+    ck_assert_int_eq(ret, -1);
+    ck_assert_uint_eq(s.dhcp_server_ip, 0U);
 
     /* --- Scenario 2: code + length are the last two bytes of the
      * options field; the four data bytes split 2 + 2 into sname. --- */
@@ -3681,8 +3685,8 @@ START_TEST(test_dhcp_parse_offer_option_split_across_region_boundary)
     sn[4] = DHCP_OPTION_END;
 
     ret = dhcp_parse_offer(&s, &msg, DHCP_HEADER_LEN + opt_len);
-    ck_assert_int_eq(ret, 0);
-    ck_assert_uint_eq(s.dhcp_server_ip, 0x0A000064U);
+    ck_assert_int_eq(ret, -1);
+    ck_assert_uint_eq(s.dhcp_server_ip, 0U);
 
     /* --- Scenario 3: overload = both; the server id starts at the
      * end of sname (pads precede it) and its data runs into file. --- */
@@ -3710,8 +3714,8 @@ START_TEST(test_dhcp_parse_offer_option_split_across_region_boundary)
     fl[2] = DHCP_OPTION_END;
 
     ret = dhcp_parse_offer(&s, &msg, DHCP_HEADER_LEN + opt_len);
-    ck_assert_int_eq(ret, 0);
-    ck_assert_uint_eq(s.dhcp_server_ip, 0x0A000064U);
+    ck_assert_int_eq(ret, -1);
+    ck_assert_uint_eq(s.dhcp_server_ip, 0U);
 }
 END_TEST
 START_TEST(test_fifo_push_and_pop) {

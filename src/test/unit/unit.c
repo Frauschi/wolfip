@@ -543,7 +543,7 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_utils, test_dns_callback_rejects_a_record_with_wrong_rdlength);
     tcase_add_test(tc_utils, test_dhcp_parse_offer_option_overload);
     tcase_add_test(tc_utils,
-                   test_dhcp_parse_offer_option_split_across_region_boundary);
+                   test_dhcp_parse_offer_option_split_across_region_boundary_rejected);
     tcase_add_test(tc_utils, test_dhcp_discover_first_retry_delay_rfc2131);
     tcase_add_test(tc_utils, test_dhcp_discover_sets_broadcast_flag);
     tcase_add_test(tc_utils, test_dhcp_request_broadcast_flag_by_state);

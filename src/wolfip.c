@@ -8675,15 +8675,6 @@ struct dhcp_opt_stream {
     uint8_t region;  /* 0 options, 1 sname, 2 file */
     uint8_t overload;
     int strict;      /* -1 on malformed, or treat as end of stream */
-    /* Option in progress across a region boundary, materialized here as
-     * it is read: the sname and file fields live in separate parts of
-     * the message, so an option whose bytes span a boundary cannot be
-     * handed out as a contiguous [code, len, data...] block in place.
-     * fill is NULL when no option is in progress; the buffer holds one
-     * full option at most (1 + 1 + 255 bytes). */
-    uint8_t *fill;
-    uint8_t part_in_region0;
-    uint8_t part_buf[257];
 };
 
 static void dhcp_opt_stream_init(struct dhcp_opt_stream *st,
@@ -8702,8 +8693,6 @@ static void dhcp_opt_stream_init(struct dhcp_opt_stream *st,
     st->region = 0;
     st->overload = 0;
     st->strict = strict;
-    st->fill = NULL;
-    st->part_in_region0 = 0;
 }
 
 /* Advance the stream to the next region selected by option 52. Return 1
@@ -8745,44 +8734,6 @@ static int dhcp_opt_stream_next(struct dhcp_opt_stream *st, uint8_t *code,
     while (1) {
         uint8_t c;
         uint8_t l;
-        if (st->fill != NULL) {
-            /* Option in progress across region boundaries: pull bytes
-             * from the current region into part_buf until the option is
-             * complete. Its total size (2 + part_buf[1]) is known once
-             * the header bytes have been collected. */
-            while (st->ptr < st->end &&
-                   (st->fill < st->part_buf + 2 ||
-                    st->fill < st->part_buf + 2 + st->part_buf[1]))
-                *st->fill++ = *st->ptr++;
-            if (st->fill >= st->part_buf + 2 &&
-                st->fill >= st->part_buf + 2 + st->part_buf[1]) {
-                if (st->part_in_region0 &&
-                    st->part_buf[0] == DHCP_OPTION_OVERLOAD) {
-                    if (st->part_buf[1] != 1 || st->part_buf[2] < 1 ||
-                        st->part_buf[2] > 3) {
-                        st->fill = NULL;
-                        if (st->strict)
-                            return -1;
-                        return 0;
-                    }
-                    st->overload = st->part_buf[2];
-                }
-                *code = st->part_buf[0];
-                *len = st->part_buf[1];
-                *data = st->part_buf;
-                st->fill = NULL;
-                return 1;
-            }
-            /* Region exhausted mid-option: continue into the next
-             * overloaded region, or end the stream. */
-            if (!dhcp_opt_stream_next_region(st)) {
-                st->fill = NULL;
-                if (st->strict)
-                    return -1;
-                return 0;
-            }
-            continue;
-        }
         if (st->ptr + 1 > st->end)
             goto region_end;
         c = st->ptr[0];
@@ -8799,13 +8750,16 @@ static int dhcp_opt_stream_next(struct dhcp_opt_stream *st, uint8_t *code,
         }
         if (st->ptr + 2 > st->end ||
             st->ptr + 2 + st->ptr[1] > st->end) {
-            /* Option header or data runs past the region end. RFC 2132
-             * §9.3 makes the sname/file fields a continuation of the
-             * option stream, so materialize the option across the
-             * boundary instead of dropping it. */
-            st->fill = st->part_buf;
-            st->part_in_region0 = (st->region == 0);
-            continue;
+            /* Option header or data runs past this field's end. RFC
+             * 2132 sec.3.2: the end option marks the end of valid
+             * information in the vendor field, and sec.9.3: the
+             * overloaded fields are separate option lists interpreted
+             * after the standard option fields - an option must not
+             * span a field boundary. Strict: malformed; non-strict:
+             * end of stream, as with other truncation. */
+            if (st->strict)
+                return -1;
+            return 0;
         }
         l = st->ptr[1];
         if (st->region == 0 && c == DHCP_OPTION_OVERLOAD) {
