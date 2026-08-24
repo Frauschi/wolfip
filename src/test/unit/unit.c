@@ -963,6 +963,7 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_proto, test_icmp_input_dest_unreach_port_unreachable_mismatched_orig_src_port_ignored);
     tcase_add_test(tc_proto, test_icmp_input_dest_unreach_port_unreachable_mismatched_orig_dst_port_ignored);
     tcase_add_test(tc_proto, test_udp_sendto_and_recvfrom);
+    tcase_add_test(tc_proto, test_udp_wildcard_bind_receives_all_local_addrs);
     tcase_add_test(tc_proto, test_udp_sendto_respects_mtu_api);
     tcase_add_test(tc_proto, test_udp_recvfrom_sets_remote_ip);
     tcase_add_test(tc_proto, test_udp_recvfrom_null_src_addr_len);

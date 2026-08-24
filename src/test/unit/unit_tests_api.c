@@ -867,6 +867,54 @@ START_TEST(test_udp_sendto_and_recvfrom)
 }
 END_TEST
 
+START_TEST(test_udp_wildcard_bind_receives_all_local_addrs)
+{
+    struct wolfIP s;
+    int sd;
+    struct wolfIP_sockaddr_in sin;
+    struct wolfIP_sockaddr_in from;
+    socklen_t from_len = sizeof(from);
+    uint8_t payload[4] = {1, 2, 3, 4};
+    uint8_t rxbuf[LINK_MTU];
+    int ret;
+
+    setup_stack_with_two_ifaces(&s, 0x0A000001U, 0x0A010001U);
+
+    sd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_DGRAM, WI_IPPROTO_UDP);
+    ck_assert_int_gt(sd, 0);
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(5353);
+    sin.sin_addr.s_addr = 0U; /* INADDR_ANY */
+    ck_assert_int_eq(wolfIP_sock_bind(&s, sd, (struct wolfIP_sockaddr *)&sin,
+            sizeof(sin)), 0);
+
+    /* A datagram addressed to the interface whose address was selected
+     * as the egress address at bind time is delivered. */
+    inject_udp_datagram(&s, TEST_PRIMARY_IF, 0x0A000064U, 0x0A000001U,
+            60000, 5353, payload, sizeof(payload));
+    memset(&from, 0, sizeof(from));
+    ret = wolfIP_sock_recvfrom(&s, sd, rxbuf, sizeof(rxbuf), 0,
+            (struct wolfIP_sockaddr *)&from, &from_len);
+    ck_assert_int_eq(ret, (int)sizeof(payload));
+    ck_assert_mem_eq(rxbuf, payload, sizeof(payload));
+
+    /* A datagram addressed to the other local address must be delivered
+     * too: a wildcard bind receives on every local address (POSIX). The
+     * pre-fix match compared only the egress address selected at bind
+     * time (local_ip), rejecting this datagram and replying
+     * port-unreachable. */
+    inject_udp_datagram(&s, TEST_SECOND_IF, 0x0A010064U, 0x0A010001U,
+            60001, 5353, payload, sizeof(payload));
+    memset(&from, 0, sizeof(from));
+    ret = wolfIP_sock_recvfrom(&s, sd, rxbuf, sizeof(rxbuf), 0,
+            (struct wolfIP_sockaddr *)&from, &from_len);
+    ck_assert_int_eq(ret, (int)sizeof(payload));
+    ck_assert_mem_eq(rxbuf, payload, sizeof(payload));
+    ck_assert_uint_eq(from.sin_port, ee16(60001));
+}
+END_TEST
+
 START_TEST(test_udp_sendto_respects_mtu_api)
 {
     struct wolfIP s;

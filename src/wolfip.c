@@ -2786,9 +2786,20 @@ static void udp_try_recv(struct wolfIP *s, unsigned int if_idx,
          * address while DHCP is running. */
         int is_dhcp = (s->dhcp_udp_sd > 0) &&
                 ((uint32_t)(MARK_UDP_SOCKET | i) == (uint32_t)s->dhcp_udp_sd);
+        /* Ingress matching uses the bound address, not the egress address
+         * selected into local_ip at bind time: a wildcard (INADDR_ANY)
+         * bind must receive datagrams addressed to any local address
+         * (POSIX), the same rule the TCP LISTEN match applies via
+         * bound_local_ip. local_ip/if_idx stay egress-only. The
+         * t->local_ip != 0 guard keeps an unbound socket (local_ip == 0)
+         * out of the match: only the DHCP relaxation above may deliver
+         * to one. */
+        int bound_match = (t->local_ip != 0) &&
+                ((t->bound_local_ip == IPADDR_ANY) ||
+                 (t->bound_local_ip == dst_ip));
         int addr_match =
                 (((t->local_ip == 0) && DHCP_IS_RUNNING(s) && is_dhcp) ||
-                 (t->local_ip == dst_ip && peer_match));
+                 (bound_match && peer_match));
 #ifdef IP_MULTICAST
         if (wolfIP_ip_is_multicast(dst_ip)) {
             addr_match = udp_socket_has_mcast(t, if_idx, dst_ip) &&
