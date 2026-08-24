@@ -1476,7 +1476,7 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_core, test_dhcp_nak_relearns_dns_server);
     tcase_add_test(tc_core, test_dhcp_lease_expiry_keeps_pinned_dns_server);
     tcase_add_test(tc_core, test_dhcp_public_apis_null_stack_safe);
-    /* --- unit_tests_ip_arp_recv.c (35 tests) --- */
+    /* --- unit_tests_ip_arp_recv.c (38 tests) --- */
     tcase_add_test(tc_core, test_ip_recv_limited_broadcast_dst_is_local);
     tcase_add_test(tc_core, test_ip_recv_directed_broadcast_dst_is_local);
     tcase_add_test(tc_core, test_ip_recv_ipaddr_any_dst_is_local);
@@ -1489,6 +1489,9 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_core, test_ip_recv_forward_link_local_src_rpf_drop);
     tcase_add_test(tc_core, test_ip_recv_forward_self_ip_src_dropped);
     tcase_add_test(tc_core, test_ip_recv_l2_broadcast_frame_not_forwarded);
+    tcase_add_test(tc_core, test_ip_recv_forward_no_route_dropped_not_dispatched);
+    tcase_add_test(tc_core, test_ip_recv_l2_group_not_locally_deliverable_dropped);
+    tcase_add_test(tc_core, test_ip_recv_l2_group_dhcp_still_reaches_local_udp);
     tcase_add_test(tc_core, test_ip_recv_options_nop_delivered);
     tcase_add_test(tc_core, test_ip_recv_options_rr_stripped_and_delivered);
     tcase_add_test(tc_core, test_ip_recv_options_bad_length_aborts_parse);

@@ -10403,6 +10403,44 @@ static inline void ip_recv(struct wolfIP *s, unsigned int if_idx,
                         broadcast);
                 return;
             }
+            /* No connected or static route to a non-local destination:
+             * discard. A router must not pass unroutable traffic on to its
+             * own protocol handlers (RFC 1122 sec.4.2.2.9). The ICMP
+             * Network Unreachable reply is a separate concern (F-1332,
+             * wont_fix) and is intentionally not sent here. */
+            return;
+            }
+            else {
+                /* l2_group (RFC 1812 sec.5.3.4): a link-layer group frame
+                 * must never be forwarded, but local delivery is legitimate
+                 * only for traffic this stack itself consumes:
+                 *  - IGMP queries/reports (router-facing, 224.0.0.x),
+                 *  - IP multicast for locally joined groups,
+                 *  - DHCP server -> client (UDP 67 -> 68): OFFER/ACK arrive
+                 *    L2-broadcast carrying an ip.dst the client does not
+                 *    own yet (RFC 2131).
+                 * Anything else is not addressed to this node: discard
+                 * instead of falling through to local dispatch. */
+                int locally_deliverable = 0;
+#ifdef IP_MULTICAST
+                if (ip->proto == WI_IPPROTO_IGMP ||
+                        wolfIP_ip_is_multicast(dest))
+                    locally_deliverable = 1;
+#endif
+                if (!locally_deliverable && ip->proto == WI_IPPROTO_UDP &&
+                        len >=
+                        (uint32_t)(ETH_HEADER_LEN + ip_hlen + UDP_HEADER_LEN)) {
+                    const uint8_t *uh =
+                        (const uint8_t *)ip + ETH_HEADER_LEN + ip_hlen;
+                    uint16_t sport, dport;
+                    memcpy(&sport, uh + 0, sizeof(sport));
+                    memcpy(&dport, uh + 2, sizeof(dport));
+                    if (ee16(sport) == DHCP_SERVER_PORT &&
+                            ee16(dport) == DHCP_CLIENT_PORT)
+                        locally_deliverable = 1;
+                }
+                if (!locally_deliverable)
+                    return;
             }
         }
     }
