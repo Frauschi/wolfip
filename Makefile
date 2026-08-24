@@ -75,10 +75,15 @@ ifeq ($(BUILD_VDE),1)
   CFLAGS+=-DWOLFIP_USE_VDE=1
   LDFLAGS+=-lvdeplug
 else
-  # TAP device driver (default)
-  TAP_SRC:=src/port/posix/tap_$(UNAME_LC).c
-  ifeq ($(wildcard $(TAP_SRC)),)
-    TAP_SRC:=src/port/posix/tap_linux.c
+  # Host netdev driver (default): TAP (L2) on Linux/FreeBSD, point-to-point
+  # utun (L3, non-ethernet) on macOS
+  ifeq ($(UNAME_LC),darwin)
+    TAP_SRC:=src/port/posix/utun_darwin.c
+  else
+    TAP_SRC:=src/port/posix/tap_$(UNAME_LC).c
+    ifeq ($(wildcard $(TAP_SRC)),)
+      TAP_SRC:=src/port/posix/tap_linux.c
+    endif
   endif
   NETDEV_SRC:=$(TAP_SRC)
   NETDEV_OBJ:=$(patsubst src/%.c,build/%.o,$(TAP_SRC))
