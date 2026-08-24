@@ -6666,22 +6666,16 @@ int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *add
                 sin->sin_port = ee16(ts->dst_port);
                 sin->sin_addr.s_addr = ee32(ts->remote_ip);
             }
-            ts->sock.tcp.state = TCP_LISTEN;
-            tcp_ctrl_rto_stop(ts);
             /* The accepted connection owns the handshake now (its SYN-ACK
-             * lives in the clone's TX FIFO). Drop segments parked by the
-             * half-open connection: the flush refreshes a parked segment's
-             * ack from the socket's current state, so a stale SYN-ACK would
-             * be retransmitted for the listener's next connection with the
-             * new connection's ack value and a wrong destination port. */
-            fifo_init(&ts->sock.tcp.txbuf, ts->txmem, TXBUF_SIZE);
-            ts->sock.tcp.seq = wolfIP_getrandom();
-            if (ts->bound_local_ip != IPADDR_ANY) {
-                int bound_match = 0;
-                unsigned int bound_if = wolfIP_if_for_local_ip(s, ts->bound_local_ip, &bound_match);
-                ts->if_idx = bound_match ? (uint8_t)bound_if : ts->if_idx;
-                ts->local_ip = ts->bound_local_ip;
-            }
+             * lives in the clone's TX FIFO). Revert the listener to the
+             * fresh-socket baseline: the old partial reset (state, RTO,
+             * TX FIFO, seq, bound address) left the dead connection's PAWS
+             * state (last_ts/ts_enabled/ts_recent_valid), window scale,
+             * MSS and stale peer identity on the port, so the next
+             * connection inherited a stale TS.Recent and had its
+             * timestamped traffic dropped by PAWS. */
+            tcp_ctrl_rto_stop(ts);
+            tcp_listener_revert_to_listen(ts);
             if (wolfIP_filter_notify_socket_event(
                     WOLFIP_FILT_ACCEPTING, s, newts,
                     newts->local_ip, newts->src_port, newts->remote_ip, newts->dst_port) != 0) {

@@ -2518,8 +2518,10 @@ static void inject_tcp_syn_ts(struct wolfIP *s, unsigned int if_idx,
     syn->dst_port = ee16(dst_port);
     syn->seq = ee32(1);
     syn->ack = 0;
+    /* hlen stores the TCP header size in the 0xF0 encoding (bytes << 2),
+     * the same layout as the on-wire data-offset field. */
     syn->hlen = (uint8_t)((TCP_HEADER_LEN + sizeof(struct tcp_opt_mss) +
-            sizeof(struct tcp_opt_ts)) / 4);
+            sizeof(struct tcp_opt_ts)) << 2);
     syn->flags = TCP_FLAG_SYN;
     syn->win = ee16(65535);
     syn->csum = 0;
@@ -2579,7 +2581,9 @@ START_TEST(test_sock_accept_listener_resets_paws_state)
             0x10000000U);
     ck_assert_int_eq(listener->sock.tcp.state, TCP_SYN_RCVD);
     ck_assert_uint_eq(listener->sock.tcp.ts_enabled, 1);
-    ck_assert_uint_eq(listener->sock.tcp.last_ts, 0x10000000U);
+    /* last_ts is stored byte-swapped relative to the host timestamp value
+     * (the PAWS machinery recovers it with ee32; see the proto tests). */
+    ck_assert_uint_eq(listener->sock.tcp.last_ts, ee32(0x10000000U));
     ck_assert_uint_eq(listener->sock.tcp.ts_recent_valid, 1);
 
     wolfIP_sock_accept(&s, listen_sd, (struct wolfIP_sockaddr *)&sin, &alen);
@@ -2600,7 +2604,7 @@ START_TEST(test_sock_accept_listener_resets_paws_state)
             100U);
     ck_assert_int_eq(listener->sock.tcp.state, TCP_SYN_RCVD);
     ck_assert_uint_eq(listener->sock.tcp.ts_enabled, 1);
-    ck_assert_uint_eq(listener->sock.tcp.last_ts, 100U);
+    ck_assert_uint_eq(listener->sock.tcp.last_ts, ee32(100U));
     ck_assert_uint_eq(listener->sock.tcp.ts_recent_valid, 1);
 }
 END_TEST
