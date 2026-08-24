@@ -505,6 +505,70 @@ START_TEST(test_dhcp_parse_offer_subnet_mask_len_lt4_rejected)
 }
 END_TEST
 
+/* F-11429: DHCP options are order-independent (RFC 2132). A valid
+ * DHCPOFFER that places the server identifier and subnet mask before the
+ * message-type option must be accepted, not rejected. */
+START_TEST(test_dhcp_parse_offer_options_before_msg_type_accepted)
+{
+    struct wolfIP s;
+    struct dhcp_msg msg;
+    uint8_t *p;
+
+    wolfIP_init(&s);
+    s.dhcp_xid = 0x4004U;
+    s.dhcp_state = DHCP_DISCOVER_SENT;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.op = BOOT_REPLY;
+    msg.magic = ee32(DHCP_MAGIC);
+    msg.xid = ee32(s.dhcp_xid);
+    msg.yiaddr = ee32(0x0A000064U);
+    p = (uint8_t *)msg.options;
+    /* Required options before the message-type option. */
+    p[0] = DHCP_OPTION_SERVER_ID; p[1] = 4;
+    p[2] = 10; p[3] = 0; p[4] = 0; p[5] = 1;
+    p += 6;
+    p[0] = DHCP_OPTION_SUBNET_MASK; p[1] = 4;
+    p[2] = 0xFF; p[3] = 0xFF; p[4] = 0xFF; p[5] = 0x00;
+    p += 6;
+    p[0] = DHCP_OPTION_MSG_TYPE; p[1] = 1; p[2] = DHCP_OFFER; p += 3;
+    p[0] = DHCP_OPTION_END;
+
+    ck_assert_int_eq(dhcp_parse_offer(&s, &msg, sizeof(msg)), 0);
+    ck_assert_uint_eq(s.dhcp_server_ip, 0x0A000001U);
+    ck_assert_uint_eq(s.dhcp_ip, 0x0A000064U);
+    ck_assert_uint_eq(s.dhcp_offered_mask, 0xFFFFFF00U);
+    ck_assert_uint_eq(s.dhcp_state, DHCP_REQUEST_SENT);
+}
+END_TEST
+
+/* A truncated server identifier is rejected wherever it appears in the
+ * option stream, including before the message-type option. */
+START_TEST(test_dhcp_parse_offer_bad_server_id_before_msg_type_rejected)
+{
+    struct wolfIP s;
+    struct dhcp_msg msg;
+    uint8_t *p;
+
+    wolfIP_init(&s);
+    s.dhcp_xid = 0x4005U;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.op = BOOT_REPLY;
+    msg.magic = ee32(DHCP_MAGIC);
+    msg.xid = ee32(s.dhcp_xid);
+    msg.yiaddr = ee32(0x0A000064U);
+    p = (uint8_t *)msg.options;
+    /* SERVER_ID with len=2 < 4, before the message-type option. */
+    p[0] = DHCP_OPTION_SERVER_ID; p[1] = 2; p[2] = 10; p[3] = 0;
+    p += 4;
+    p[0] = DHCP_OPTION_MSG_TYPE; p[1] = 1; p[2] = DHCP_OFFER; p += 3;
+    p[0] = DHCP_OPTION_END;
+
+    ck_assert_int_eq(dhcp_parse_offer(&s, &msg, sizeof(msg)), -1);
+}
+END_TEST
+
 START_TEST(test_dhcp_parse_offer_inner_truncated_opt2_rejected)
 {
     struct wolfIP s;
@@ -590,17 +654,20 @@ START_TEST(test_dhcp_parse_offer_inner_pad_then_end)
 }
 END_TEST
 
-START_TEST(test_dhcp_parse_offer_outer_end_with_state_already_set)
+START_TEST(test_dhcp_parse_offer_non_offer_with_stale_state_rejected)
 {
-    /* Covers the branch at line ~7487:
-     * saw_end=1 after outer END, dhcp_server_ip != 0 && dhcp_ip != 0 → 0 */
+    /* A non-OFFER reply must be rejected outright, even if stale offer
+     * state is present: re-arming REQUEST_SENT from a stale offer in
+     * response to an ACK/NAK-type message would request a lease this
+     * round's OFFER never granted. */
     struct wolfIP s;
     struct dhcp_msg msg;
     uint8_t *p;
 
     wolfIP_init(&s);
     s.dhcp_xid = 0x5005U;
-    /* Pre-set as if an OFFER was already processed */
+    s.dhcp_state = DHCP_DISCOVER_SENT;
+    /* Pre-set as if an OFFER from an earlier round was processed. */
     s.dhcp_server_ip = 0x0A000001U;
     s.dhcp_ip = 0x0A000064U;
 
@@ -609,13 +676,12 @@ START_TEST(test_dhcp_parse_offer_outer_end_with_state_already_set)
     msg.magic = ee32(DHCP_MAGIC);
     msg.xid = ee32(s.dhcp_xid);
     p = (uint8_t *)msg.options;
-    /* MSG_TYPE = ACK (not OFFER) so inner body not entered; outer loop sees END */
+    /* MSG_TYPE = ACK (not OFFER). */
     p[0] = DHCP_OPTION_MSG_TYPE; p[1] = 1; p[2] = DHCP_ACK; p += 3;
     p[0] = DHCP_OPTION_END;
 
-    /* outer saw_end=1, server_ip != 0, dhcp_ip != 0 → returns 0 */
-    ck_assert_int_eq(dhcp_parse_offer(&s, &msg, sizeof(msg)), 0);
-    ck_assert_int_eq(s.dhcp_state, DHCP_REQUEST_SENT);
+    ck_assert_int_eq(dhcp_parse_offer(&s, &msg, sizeof(msg)), -1);
+    ck_assert_uint_eq(s.dhcp_state, DHCP_DISCOVER_SENT);
 }
 END_TEST
 

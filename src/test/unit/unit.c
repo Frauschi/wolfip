@@ -1438,11 +1438,13 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_core, test_dhcp_msg_type_nak_absent_server_id_rejected);
     tcase_add_test(tc_core, test_dhcp_msg_type_nak_matching_server_id_accepted);
     tcase_add_test(tc_core, test_dhcp_parse_offer_type_ack_not_offer_rejected);
+    tcase_add_test(tc_core, test_dhcp_parse_offer_options_before_msg_type_accepted);
+    tcase_add_test(tc_core, test_dhcp_parse_offer_bad_server_id_before_msg_type_rejected);
     tcase_add_test(tc_core, test_dhcp_parse_offer_subnet_mask_len_lt4_rejected);
     tcase_add_test(tc_core, test_dhcp_parse_offer_inner_truncated_opt2_rejected);
     tcase_add_test(tc_core, test_dhcp_parse_offer_inner_truncated_data_rejected);
     tcase_add_test(tc_core, test_dhcp_parse_offer_inner_pad_then_end);
-    tcase_add_test(tc_core, test_dhcp_parse_offer_outer_end_with_state_already_set);
+    tcase_add_test(tc_core, test_dhcp_parse_offer_non_offer_with_stale_state_rejected);
     tcase_add_test(tc_core, test_dhcp_parse_ack_mismatched_server_id_rejected);
     tcase_add_test(tc_core, test_dhcp_parse_ack_server_id_len_lt4_rejected);
     tcase_add_test(tc_core, test_dhcp_parse_ack_offer_ip_len_lt4_rejected);

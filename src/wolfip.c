@@ -8851,6 +8851,7 @@ static int dhcp_parse_offer(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg
     struct dhcp_opt_stream st;
     int saw_end = 0;
     int saw_server_id = 0;
+    int msg_type = 0;
     uint32_t ip;
     uint32_t netmask = DHCP_DEFAULT_24BIT_NETMASK;
     if (msg_len < DHCP_HEADER_LEN)
@@ -8861,6 +8862,9 @@ static int dhcp_parse_offer(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg
         return -1;
     if (ee32(msg->xid) != s->dhcp_xid)
         return -1;
+    /* RFC 2132: options are order-independent. Collect the fields in one
+     * pass regardless of order and validate the message type and the
+     * required options at the end of the stream. */
     dhcp_opt_stream_init(&st, msg, msg_len, 1);
     while (1) {
         uint8_t code;
@@ -8878,54 +8882,38 @@ static int dhcp_parse_offer(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg
         if (code == DHCP_OPTION_MSG_TYPE) {
             if (len != 1)
                 return -1;
-            if (data[2] == DHCP_OFFER) {
-                while (1) {
-                    uint8_t *idata;
-                    r = dhcp_opt_stream_next(&st, &code, &len, &idata);
-                    if (r < 0)
-                        return -1;
-                    if (r == 0)
-                        break;
-                    if (code == DHCP_OPTION_END) {
-                        saw_end = 1;
-                        break;
-                    }
-                    if (code == DHCP_OPTION_SERVER_ID) {
-                        if (len < 4)
-                            return -1;
-                        s->dhcp_server_ip =
-                            DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                        saw_server_id = 1;
-                    }
-                    if (code == DHCP_OPTION_SUBNET_MASK) {
-                        if (len < 4)
-                            return -1;
-                        netmask =
-                            DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                    }
-                }
-                if (!saw_end || !saw_server_id)
-                    return -1;
-                ip = ee32(msg->yiaddr);
-                if (!dhcp_lease_ip_sane(ip, netmask))
-                    return -1;
-                /* Stash the offer; the interface is not reconfigured
-                 * until the server's ACK confirms the lease. */
-                s->dhcp_ip = ip;
-                s->dhcp_offered_mask = netmask;
-                dhcp_cancel_timer(s);
-                s->dhcp_state = DHCP_REQUEST_SENT;
-                return 0;
-            }
+            msg_type = data[2];
+        }
+        else if (code == DHCP_OPTION_SERVER_ID) {
+            if (len < 4)
+                return -1;
+            s->dhcp_server_ip =
+                DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+            saw_server_id = 1;
+        }
+        else if (code == DHCP_OPTION_SUBNET_MASK) {
+            if (len < 4)
+                return -1;
+            netmask =
+                DHCP_OPT_data_to_u32((struct dhcp_option *)data);
         }
     }
     if (!saw_end)
         return -1;
-    if ((s->dhcp_server_ip != 0) && (s->dhcp_ip != 0)) {
-        s->dhcp_state = DHCP_REQUEST_SENT;
-        return 0;
-    }
-    return -1;
+    if (msg_type != DHCP_OFFER)
+        return -1;
+    if (!saw_server_id)
+        return -1;
+    ip = ee32(msg->yiaddr);
+    if (!dhcp_lease_ip_sane(ip, netmask))
+        return -1;
+    /* Stash the offer; the interface is not reconfigured
+     * until the server's ACK confirms the lease. */
+    s->dhcp_ip = ip;
+    s->dhcp_offered_mask = netmask;
+    dhcp_cancel_timer(s);
+    s->dhcp_state = DHCP_REQUEST_SENT;
+    return 0;
 }
 
 
