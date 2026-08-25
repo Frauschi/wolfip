@@ -2577,6 +2577,49 @@ static int timers_binheap_insert(struct timers_binheap *heap, struct wolfIP_time
     return tmr.id;
 }
 
+/* The app tick source may be a 32-bit counter that the stack keeps
+ * zero-extended in 64-bit fields. When the source wraps (or restarts from
+ * a lower value), a plain 64-bit comparison against a pending deadline
+ * stalls until the clock lapses the old value. Compare in the source's
+ * 32-bit domain with a signed difference (RFC 1982, the same convention
+ * as the tcp_seq_* helpers): for two values within half a counter period
+ * (~24.8 days at a 1 ms tick) the sign of the modular difference is the
+ * true temporal order, which is exact for a wrapping 32-bit source and
+ * fine for any 64-bit source whose pending deadlines sit within half a
+ * 32-bit period of now. */
+static inline int tick_expired(uint64_t expires, uint64_t now)
+{
+    return (int32_t)((uint32_t)expires - (uint32_t)now) <= 0;
+}
+
+/* Move an absolute deadline from the old tick domain into the current
+ * 32-bit source domain after a rollback. A deadline already due in the
+ * new domain is clamped to fire on this poll (tick 1 when now == 0, since
+ * expires == 0 is the heap's cancelled sentinel). */
+static inline uint64_t tick_rebase(uint64_t abs, uint64_t now)
+{
+    uint32_t v = (uint32_t)abs;
+
+    if (tick_expired(v, now))
+        return (now != 0) ? now : 1;
+    return v;
+}
+
+/* Rebase the pending timer heap after a tick-source rollback (see
+ * wolfIP_poll). Every live timer expires strictly after s->last_tick, so
+ * for a realistic wrap (old tick near 2^32, new tick small) the rebased
+ * values land in [now, now + max delay] and preserve min-heap order - no
+ * re-heapify needed. */
+static void timers_heap_rebase(struct timers_binheap *heap, uint64_t now)
+{
+    uint32_t i;
+
+    for (i = 0; i < heap->size; i++) {
+        if (heap->timers[i].expires != 0)
+            heap->timers[i].expires = tick_rebase(heap->timers[i].expires, now);
+    }
+}
+
 static int is_timer_expired(struct timers_binheap *heap, uint64_t now)
 {
     while (heap->size > 0 && heap->timers[0].expires == 0) {
@@ -2585,7 +2628,7 @@ static int is_timer_expired(struct timers_binheap *heap, uint64_t now)
     if (heap->size == 0) {
         return 0;
     }
-    return (heap->timers[0].expires <= now)?1:0;
+    return tick_expired(heap->timers[0].expires, now);
 }
 
 /* Restore the min-heap property after the element at index i was replaced
@@ -2743,9 +2786,20 @@ static void udp_try_recv(struct wolfIP *s, unsigned int if_idx,
          * address while DHCP is running. */
         int is_dhcp = (s->dhcp_udp_sd > 0) &&
                 ((uint32_t)(MARK_UDP_SOCKET | i) == (uint32_t)s->dhcp_udp_sd);
+        /* Ingress matching uses the bound address, not the egress address
+         * selected into local_ip at bind time: a wildcard (INADDR_ANY)
+         * bind must receive datagrams addressed to any local address
+         * (POSIX), the same rule the TCP LISTEN match applies via
+         * bound_local_ip. local_ip/if_idx stay egress-only. The
+         * t->local_ip != 0 guard keeps an unbound socket (local_ip == 0)
+         * out of the match: only the DHCP relaxation above may deliver
+         * to one. */
+        int bound_match = (t->local_ip != 0) &&
+                ((t->bound_local_ip == IPADDR_ANY) ||
+                 (t->bound_local_ip == dst_ip));
         int addr_match =
                 (((t->local_ip == 0) && DHCP_IS_RUNNING(s) && is_dhcp) ||
-                 (t->local_ip == dst_ip && peer_match));
+                 (bound_match && peer_match));
 #ifdef IP_MULTICAST
         if (wolfIP_ip_is_multicast(dst_ip)) {
             addr_match = udp_socket_has_mcast(t, if_idx, dst_ip) &&
@@ -6623,22 +6677,16 @@ int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *add
                 sin->sin_port = ee16(ts->dst_port);
                 sin->sin_addr.s_addr = ee32(ts->remote_ip);
             }
-            ts->sock.tcp.state = TCP_LISTEN;
-            tcp_ctrl_rto_stop(ts);
             /* The accepted connection owns the handshake now (its SYN-ACK
-             * lives in the clone's TX FIFO). Drop segments parked by the
-             * half-open connection: the flush refreshes a parked segment's
-             * ack from the socket's current state, so a stale SYN-ACK would
-             * be retransmitted for the listener's next connection with the
-             * new connection's ack value and a wrong destination port. */
-            fifo_init(&ts->sock.tcp.txbuf, ts->txmem, TXBUF_SIZE);
-            ts->sock.tcp.seq = wolfIP_getrandom();
-            if (ts->bound_local_ip != IPADDR_ANY) {
-                int bound_match = 0;
-                unsigned int bound_if = wolfIP_if_for_local_ip(s, ts->bound_local_ip, &bound_match);
-                ts->if_idx = bound_match ? (uint8_t)bound_if : ts->if_idx;
-                ts->local_ip = ts->bound_local_ip;
-            }
+             * lives in the clone's TX FIFO). Revert the listener to the
+             * fresh-socket baseline: the old partial reset (state, RTO,
+             * TX FIFO, seq, bound address) left the dead connection's PAWS
+             * state (last_ts/ts_enabled/ts_recent_valid), window scale,
+             * MSS and stale peer identity on the port, so the next
+             * connection inherited a stale TS.Recent and had its
+             * timestamped traffic dropped by PAWS. */
+            tcp_ctrl_rto_stop(ts);
+            tcp_listener_revert_to_listen(ts);
             if (wolfIP_filter_notify_socket_event(
                     WOLFIP_FILT_ACCEPTING, s, newts,
                     newts->local_ip, newts->src_port, newts->remote_ip, newts->dst_port) != 0) {
@@ -8675,15 +8723,6 @@ struct dhcp_opt_stream {
     uint8_t region;  /* 0 options, 1 sname, 2 file */
     uint8_t overload;
     int strict;      /* -1 on malformed, or treat as end of stream */
-    /* Option in progress across a region boundary, materialized here as
-     * it is read: the sname and file fields live in separate parts of
-     * the message, so an option whose bytes span a boundary cannot be
-     * handed out as a contiguous [code, len, data...] block in place.
-     * fill is NULL when no option is in progress; the buffer holds one
-     * full option at most (1 + 1 + 255 bytes). */
-    uint8_t *fill;
-    uint8_t part_in_region0;
-    uint8_t part_buf[257];
 };
 
 static void dhcp_opt_stream_init(struct dhcp_opt_stream *st,
@@ -8702,8 +8741,6 @@ static void dhcp_opt_stream_init(struct dhcp_opt_stream *st,
     st->region = 0;
     st->overload = 0;
     st->strict = strict;
-    st->fill = NULL;
-    st->part_in_region0 = 0;
 }
 
 /* Advance the stream to the next region selected by option 52. Return 1
@@ -8745,52 +8782,31 @@ static int dhcp_opt_stream_next(struct dhcp_opt_stream *st, uint8_t *code,
     while (1) {
         uint8_t c;
         uint8_t l;
-        if (st->fill != NULL) {
-            /* Option in progress across region boundaries: pull bytes
-             * from the current region into part_buf until the option is
-             * complete. Its total size (2 + part_buf[1]) is known once
-             * the header bytes have been collected. */
-            while (st->ptr < st->end &&
-                   (st->fill < st->part_buf + 2 ||
-                    st->fill < st->part_buf + 2 + st->part_buf[1]))
-                *st->fill++ = *st->ptr++;
-            if (st->fill >= st->part_buf + 2 &&
-                st->fill >= st->part_buf + 2 + st->part_buf[1]) {
-                if (st->part_in_region0 &&
-                    st->part_buf[0] == DHCP_OPTION_OVERLOAD) {
-                    if (st->part_buf[1] != 1 || st->part_buf[2] < 1 ||
-                        st->part_buf[2] > 3) {
-                        st->fill = NULL;
-                        if (st->strict)
-                            return -1;
-                        return 0;
-                    }
-                    st->overload = st->part_buf[2];
-                }
-                *code = st->part_buf[0];
-                *len = st->part_buf[1];
-                *data = st->part_buf;
-                st->fill = NULL;
-                return 1;
+        if (st->ptr + 1 > st->end) {
+            /* Field exhausted without an end option. */
+            if (st->strict && st->region == 0) {
+                /* RFC 2132 sec.3.2: the main options field must be
+                 * terminated by the end option; an end option found
+                 * later in an overloaded field must not satisfy the
+                 * main field's terminator. */
+                return -1;
             }
-            /* Region exhausted mid-option: continue into the next
-             * overloaded region, or end the stream. */
-            if (!dhcp_opt_stream_next_region(st)) {
-                st->fill = NULL;
-                if (st->strict)
-                    return -1;
-                return 0;
-            }
-            continue;
-        }
-        if (st->ptr + 1 > st->end)
             goto region_end;
+        }
         c = st->ptr[0];
         if (c == DHCP_OPTION_END) {
+            uint8_t *end_pos = st->ptr;
+            /* RFC 2132 sec.3.2: the end option marks the end of valid
+             * information in this field. If option 52 selected further
+             * overloaded fields, they are separate option lists
+             * (sec.9.3): skip this field's trailing pads and continue;
+             * only the final field's end option terminates the stream. */
+            st->ptr = st->end;
+            if (dhcp_opt_stream_next_region(st))
+                continue;
             *code = c;
             *len = 0;
-            *data = st->ptr;
-            st->ptr = st->end; /* stream ends here */
+            *data = end_pos;
             return 1;
         }
         if (c == 0) { /* Pad */
@@ -8799,13 +8815,16 @@ static int dhcp_opt_stream_next(struct dhcp_opt_stream *st, uint8_t *code,
         }
         if (st->ptr + 2 > st->end ||
             st->ptr + 2 + st->ptr[1] > st->end) {
-            /* Option header or data runs past the region end. RFC 2132
-             * §9.3 makes the sname/file fields a continuation of the
-             * option stream, so materialize the option across the
-             * boundary instead of dropping it. */
-            st->fill = st->part_buf;
-            st->part_in_region0 = (st->region == 0);
-            continue;
+            /* Option header or data runs past this field's end. RFC
+             * 2132 sec.3.2: the end option marks the end of valid
+             * information in the vendor field, and sec.9.3: the
+             * overloaded fields are separate option lists interpreted
+             * after the standard option fields - an option must not
+             * span a field boundary. Strict: malformed; non-strict:
+             * end of stream, as with other truncation. */
+            if (st->strict)
+                return -1;
+            return 0;
         }
         l = st->ptr[1];
         if (st->region == 0 && c == DHCP_OPTION_OVERLOAD) {
@@ -8851,6 +8870,7 @@ static int dhcp_parse_offer(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg
     struct dhcp_opt_stream st;
     int saw_end = 0;
     int saw_server_id = 0;
+    int msg_type = 0;
     uint32_t ip;
     uint32_t netmask = DHCP_DEFAULT_24BIT_NETMASK;
     if (msg_len < DHCP_HEADER_LEN)
@@ -8861,6 +8881,9 @@ static int dhcp_parse_offer(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg
         return -1;
     if (ee32(msg->xid) != s->dhcp_xid)
         return -1;
+    /* RFC 2132: options are order-independent. Collect the fields in one
+     * pass regardless of order and validate the message type and the
+     * required options at the end of the stream. */
     dhcp_opt_stream_init(&st, msg, msg_len, 1);
     while (1) {
         uint8_t code;
@@ -8878,54 +8901,38 @@ static int dhcp_parse_offer(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg
         if (code == DHCP_OPTION_MSG_TYPE) {
             if (len != 1)
                 return -1;
-            if (data[2] == DHCP_OFFER) {
-                while (1) {
-                    uint8_t *idata;
-                    r = dhcp_opt_stream_next(&st, &code, &len, &idata);
-                    if (r < 0)
-                        return -1;
-                    if (r == 0)
-                        break;
-                    if (code == DHCP_OPTION_END) {
-                        saw_end = 1;
-                        break;
-                    }
-                    if (code == DHCP_OPTION_SERVER_ID) {
-                        if (len < 4)
-                            return -1;
-                        s->dhcp_server_ip =
-                            DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                        saw_server_id = 1;
-                    }
-                    if (code == DHCP_OPTION_SUBNET_MASK) {
-                        if (len < 4)
-                            return -1;
-                        netmask =
-                            DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                    }
-                }
-                if (!saw_end || !saw_server_id)
-                    return -1;
-                ip = ee32(msg->yiaddr);
-                if (!dhcp_lease_ip_sane(ip, netmask))
-                    return -1;
-                /* Stash the offer; the interface is not reconfigured
-                 * until the server's ACK confirms the lease. */
-                s->dhcp_ip = ip;
-                s->dhcp_offered_mask = netmask;
-                dhcp_cancel_timer(s);
-                s->dhcp_state = DHCP_REQUEST_SENT;
-                return 0;
-            }
+            msg_type = data[2];
+        }
+        else if (code == DHCP_OPTION_SERVER_ID) {
+            if (len < 4)
+                return -1;
+            s->dhcp_server_ip =
+                DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+            saw_server_id = 1;
+        }
+        else if (code == DHCP_OPTION_SUBNET_MASK) {
+            if (len < 4)
+                return -1;
+            netmask =
+                DHCP_OPT_data_to_u32((struct dhcp_option *)data);
         }
     }
     if (!saw_end)
         return -1;
-    if ((s->dhcp_server_ip != 0) && (s->dhcp_ip != 0)) {
-        s->dhcp_state = DHCP_REQUEST_SENT;
-        return 0;
-    }
-    return -1;
+    if (msg_type != DHCP_OFFER)
+        return -1;
+    if (!saw_server_id)
+        return -1;
+    ip = ee32(msg->yiaddr);
+    if (!dhcp_lease_ip_sane(ip, netmask))
+        return -1;
+    /* Stash the offer; the interface is not reconfigured
+     * until the server's ACK confirms the lease. */
+    s->dhcp_ip = ip;
+    s->dhcp_offered_mask = netmask;
+    dhcp_cancel_timer(s);
+    s->dhcp_state = DHCP_REQUEST_SENT;
+    return 0;
 }
 
 
@@ -8973,6 +8980,7 @@ static int dhcp_parse_ack(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg_l
     struct dhcp_opt_stream st;
     int saw_end = 0;
     int saw_server_id = 0;
+    int msg_type = 0;
     struct ipconf *primary = wolfIP_primary_ipconf(s);
     uint32_t lease_ip = 0;
     uint32_t lease_mask = 0;
@@ -8999,6 +9007,9 @@ static int dhcp_parse_ack(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg_l
         return -1;
     if (ee32(msg->xid) != s->dhcp_xid)
         return -1;
+    /* RFC 2132: options are order-independent. Collect the fields in one
+     * pass regardless of order and validate the message type and the
+     * mandatory lease fields at the end of the stream. */
     dhcp_opt_stream_init(&st, msg, msg_len, 1);
     while (1) {
         uint8_t code;
@@ -9016,126 +9027,121 @@ static int dhcp_parse_ack(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg_l
         if (code == DHCP_OPTION_MSG_TYPE) {
             if (len != 1)
                 return -1;
-            if (data[2] == DHCP_ACK) {
-                while (1) {
-                    uint8_t *idata;
-                    uint32_t val;
-                    r = dhcp_opt_stream_next(&st, &code, &len, &idata);
-                    if (r < 0)
-                        return -1;
-                    if (r == 0)
-                        break;
-                    if (code == DHCP_OPTION_END) {
-                        saw_end = 1;
-                        break;
-                    }
-                    if (code == DHCP_OPTION_SERVER_ID) {
-                        if (len < 4)
-                            return -1;
-                        val = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                        /* Reject ACK from a server other than the one
-                         * we committed to during the OFFER phase. */
-                        if (s->dhcp_server_ip != 0 && val != s->dhcp_server_ip)
-                            return -1;
-                        cand_server_ip = val;
-                        saw_server_id = 1;
-                    } else if (code == DHCP_OPTION_OFFER_IP) {
-                        if (len < 4)
-                            return -1;
-                        cand_ip = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                        have_ip = 1;
-                    } else if (primary && code == DHCP_OPTION_SUBNET_MASK) {
-                        if (len < 4)
-                            return -1;
-                        cand_mask = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                        have_mask = 1;
-                    } else if (primary && code == DHCP_OPTION_ROUTER) {
-                        if (len < 4)
-                            return -1;
-                        cand_gw = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                        have_gw = 1;
-                    } else if ((code == DHCP_OPTION_DNS) && (s->dns_server == 0)) {
-                        if (len < 4)
-                            return -1;
-                        if (cand_dns == 0)
-                            cand_dns = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                    } else if (code == DHCP_OPTION_LEASE_TIME) {
-                        if (len < 4)
-                            return -1;
-                        lease_s = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                    } else if (code == DHCP_OPTION_RENEWAL_TIME) {
-                        if (len < 4)
-                            return -1;
-                        renew_s = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                    } else if (code == DHCP_OPTION_REBIND_TIME) {
-                        if (len < 4)
-                            return -1;
-                        rebind_s = DHCP_OPT_data_to_u32((struct dhcp_option *)idata);
-                    }
-                }
-                if (!saw_end)
-                    return -1;
-                /* The lease address is option 50 (the requested IP) when the
-                 * server echoes it, otherwise the yiaddr it committed; either
-                 * way it must be a usable unicast address before it is applied
-                 * to the interface. The netmask is the ACK's when it carries
-                 * one, else the interface's current mask, else the one
-                 * recorded during the OFFER phase. Both are effective values
-                 * computed here, never written until the commit below. */
-                lease_ip = have_ip ? cand_ip : ee32(msg->yiaddr);
-                lease_mask = have_mask ? cand_mask
-                            : ((primary && primary->mask != 0)
-                               ? primary->mask : s->dhcp_offered_mask);
-                /* RFC 2131: the IP-address-lease-time option (51) is mandatory
-                 * in a DHCPACK. lease_s is only ever set by that option (and a
-                 * short option already returns -1 above), so lease_s != 0 means
-                 * it was present with a valid nonzero duration. Without it the
-                 * lease would be bound with no expiry/renewal timer. */
-                if (primary && saw_server_id && lease_s != 0 &&
-                    (lease_mask != 0) &&
-                    dhcp_lease_ip_sane(lease_ip, lease_mask)) {
-                    /* Commit the validated configuration atomically. */
-                    s->dhcp_server_ip = cand_server_ip;
-                    primary->ip = lease_ip;
-                    primary->mask = lease_mask;
-                    if (have_gw)
-                        primary->gw = cand_gw;
-                    if (s->dns_server == 0 && cand_dns != 0)
-                        s->dns_server = cand_dns;
-                    dhcp_cancel_timer(s);
-                    s->dhcp_ip = primary->ip;
-#ifdef ETHERNET
-                    /* RFC 4331: probe the address before using it. The
-                     * lease timers are armed now so they are in place when
-                     * the probes complete; the short DAD timer overrides
-                     * them until then. A conflicting answer is detected in
-                     * arp_recv (dhcp_dad_conflict). */
-                    s->dhcp_state = DHCP_DAD;
-                    s->dhcp_dad_probes = 0;
-                    /* Arm the lease absolutes, then swap the renew timer for
-                     * the DAD timer: handle_timers() fires every expired
-                     * entry, so leaving both in the heap would double-fire
-                     * the renew. The absolutes survive; the DAD completion
-                     * re-arms the renew timer. */
-                    dhcp_schedule_lease_timer(s, lease_s, renew_s, rebind_s);
-                    timer_binheap_cancel(&s->timers, s->dhcp_timer);
-                    s->dhcp_timer = NO_TIMER;
-                    /* ll drivers return the frame length (>= 0) on
-                     * success, not 0; only count the probe when it
-                     * actually went out. */
-                    if (dhcp_send_dad_probe(s) >= 0)
-                        s->dhcp_dad_probes = 1;
-                    dhcp_schedule_timer_at(s,
-                            s->last_tick + DHCP_DAD_INTERVAL_MS);
-#else
-                    s->dhcp_state = DHCP_BOUND;
-                    dhcp_schedule_lease_timer(s, lease_s, renew_s, rebind_s);
-#endif
-                    return 0;
-                }
-            }
-            break; /* the message type was seen; nothing else to scan */
+            msg_type = data[2];
         }
+        else if (code == DHCP_OPTION_SERVER_ID) {
+            uint32_t val;
+            if (len < 4)
+                return -1;
+            val = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+            /* Reject ACK from a server other than the one we committed to
+             * during the OFFER phase, wherever the option appears. */
+            if (s->dhcp_server_ip != 0 && val != s->dhcp_server_ip)
+                return -1;
+            cand_server_ip = val;
+            saw_server_id = 1;
+        }
+        else if (code == DHCP_OPTION_OFFER_IP) {
+            if (len < 4)
+                return -1;
+            cand_ip = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+            have_ip = 1;
+        }
+        else if (primary && code == DHCP_OPTION_SUBNET_MASK) {
+            if (len < 4)
+                return -1;
+            cand_mask = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+            have_mask = 1;
+        }
+        else if (primary && code == DHCP_OPTION_ROUTER) {
+            if (len < 4)
+                return -1;
+            cand_gw = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+            have_gw = 1;
+        }
+        else if ((code == DHCP_OPTION_DNS) && (s->dns_server == 0)) {
+            if (len < 4)
+                return -1;
+            if (cand_dns == 0)
+                cand_dns = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+        }
+        else if (code == DHCP_OPTION_LEASE_TIME) {
+            if (len < 4)
+                return -1;
+            lease_s = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+        }
+        else if (code == DHCP_OPTION_RENEWAL_TIME) {
+            if (len < 4)
+                return -1;
+            renew_s = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+        }
+        else if (code == DHCP_OPTION_REBIND_TIME) {
+            if (len < 4)
+                return -1;
+            rebind_s = DHCP_OPT_data_to_u32((struct dhcp_option *)data);
+        }
+    }
+    if (!saw_end)
+        return -1;
+    if (msg_type != DHCP_ACK)
+        return -1;
+    /* The lease address is option 50 (the requested IP) when the
+     * server echoes it, otherwise the yiaddr it committed; either
+     * way it must be a usable unicast address before it is applied
+     * to the interface. The netmask is the ACK's when it carries
+     * one, else the interface's current mask, else the one
+     * recorded during the OFFER phase. Both are effective values
+     * computed here, never written until the commit below. */
+    lease_ip = have_ip ? cand_ip : ee32(msg->yiaddr);
+    lease_mask = have_mask ? cand_mask
+                : ((primary && primary->mask != 0)
+                   ? primary->mask : s->dhcp_offered_mask);
+    /* RFC 2131: the IP-address-lease-time option (51) is mandatory
+     * in a DHCPACK. lease_s is only ever set by that option (and a
+     * short option already returns -1 above), so lease_s != 0 means
+     * it was present with a valid nonzero duration. Without it the
+     * lease would be bound with no expiry/renewal timer. */
+    if (primary && saw_server_id && lease_s != 0 &&
+        (lease_mask != 0) &&
+        dhcp_lease_ip_sane(lease_ip, lease_mask)) {
+        /* Commit the validated configuration atomically. */
+        s->dhcp_server_ip = cand_server_ip;
+        primary->ip = lease_ip;
+        primary->mask = lease_mask;
+        if (have_gw)
+            primary->gw = cand_gw;
+        if (s->dns_server == 0 && cand_dns != 0)
+            s->dns_server = cand_dns;
+        dhcp_cancel_timer(s);
+        s->dhcp_ip = primary->ip;
+#ifdef ETHERNET
+        /* RFC 4331: probe the address before using it. The
+         * lease timers are armed now so they are in place when
+         * the probes complete; the short DAD timer overrides
+         * them until then. A conflicting answer is detected in
+         * arp_recv (dhcp_dad_conflict). */
+        s->dhcp_state = DHCP_DAD;
+        s->dhcp_dad_probes = 0;
+        /* Arm the lease absolutes, then swap the renew timer for
+         * the DAD timer: handle_timers() fires every expired
+         * entry, so leaving both in the heap would double-fire
+         * the renew. The absolutes survive; the DAD completion
+         * re-arms the renew timer. */
+        dhcp_schedule_lease_timer(s, lease_s, renew_s, rebind_s);
+        timer_binheap_cancel(&s->timers, s->dhcp_timer);
+        s->dhcp_timer = NO_TIMER;
+        /* ll drivers return the frame length (>= 0) on
+         * success, not 0; only count the probe when it
+         * actually went out. */
+        if (dhcp_send_dad_probe(s) >= 0)
+            s->dhcp_dad_probes = 1;
+        dhcp_schedule_timer_at(s,
+                s->last_tick + DHCP_DAD_INTERVAL_MS);
+#else
+        s->dhcp_state = DHCP_BOUND;
+        dhcp_schedule_lease_timer(s, lease_s, renew_s, rebind_s);
+#endif
+        return 0;
     }
     return -1;
 }
@@ -10403,6 +10409,44 @@ static inline void ip_recv(struct wolfIP *s, unsigned int if_idx,
                         broadcast);
                 return;
             }
+            /* No connected or static route to a non-local destination:
+             * discard. A router must not pass unroutable traffic on to its
+             * own protocol handlers (RFC 1122 sec.4.2.2.9). The ICMP
+             * Network Unreachable reply is a separate concern (F-1332,
+             * wont_fix) and is intentionally not sent here. */
+            return;
+            }
+            else {
+                /* l2_group (RFC 1812 sec.5.3.4): a link-layer group frame
+                 * must never be forwarded, but local delivery is legitimate
+                 * only for traffic this stack itself consumes:
+                 *  - IGMP queries/reports (router-facing, 224.0.0.x),
+                 *  - IP multicast for locally joined groups,
+                 *  - DHCP server -> client (UDP 67 -> 68): OFFER/ACK arrive
+                 *    L2-broadcast carrying an ip.dst the client does not
+                 *    own yet (RFC 2131).
+                 * Anything else is not addressed to this node: discard
+                 * instead of falling through to local dispatch. */
+                int locally_deliverable = 0;
+#ifdef IP_MULTICAST
+                if (ip->proto == WI_IPPROTO_IGMP ||
+                        wolfIP_ip_is_multicast(dest))
+                    locally_deliverable = 1;
+#endif
+                if (!locally_deliverable && ip->proto == WI_IPPROTO_UDP &&
+                        len >=
+                        (uint32_t)(ETH_HEADER_LEN + ip_hlen + UDP_HEADER_LEN)) {
+                    const uint8_t *uh =
+                        (const uint8_t *)ip + ETH_HEADER_LEN + ip_hlen;
+                    uint16_t sport, dport;
+                    memcpy(&sport, uh + 0, sizeof(sport));
+                    memcpy(&dport, uh + 2, sizeof(dport));
+                    if (ee16(sport) == DHCP_SERVER_PORT &&
+                            ee16(dport) == DHCP_CLIENT_PORT)
+                        locally_deliverable = 1;
+                }
+                if (!locally_deliverable)
+                    return;
             }
         }
     }
@@ -11793,19 +11837,36 @@ int wolfIP_poll(struct wolfIP *s, uint64_t now)
     if (!s)
         return -WOLFIP_EINVAL;
 
-#ifdef ETHERNET
     if (now < s->last_tick) {
-        unsigned int i;
         /* The tick source restarted from a lower value (e.g. the app
-         * handed off from a bare-metal tick loop to an RTOS tick). Absolute
-         * tick values from the previous domain are no longer comparable,
-         * so reset the ARP rate limit: otherwise a stale last_arp from the
-         * old domain holds the first request in the new domain for the
-         * whole stale offset. */
-        for (i = 0; i < s->if_count; i++)
-            s->arp.last_arp[i] = 0;
-    }
+         * handed off from a bare-metal tick loop to an RTOS tick, or a
+         * 32-bit source wrapped around). Absolute tick values from the
+         * previous domain are no longer comparable, so rebase pending
+         * deadlines into the new domain: timers keep their remaining time
+         * (or fire on this poll if already due) instead of stalling until
+         * the restarted clock lapses the old absolute expiries. */
+        timers_heap_rebase(&s->timers, now);
+        if (s->dhcp_renew_at != 0)
+            s->dhcp_renew_at = tick_rebase(s->dhcp_renew_at, now);
+        if (s->dhcp_rebind_at != 0)
+            s->dhcp_rebind_at = tick_rebase(s->dhcp_rebind_at, now);
+        if (s->dhcp_lease_expires != 0)
+            s->dhcp_lease_expires = tick_rebase(s->dhcp_lease_expires, now);
+        /* The in-flight acquisition start is re-timed in the new domain
+         * so elapsed-time math never compares across domains. */
+        s->dhcp_start_tick = now;
+#ifdef ETHERNET
+        {
+            unsigned int i;
+
+            /* Also reset the ARP rate limit: otherwise a stale last_arp
+             * from the old domain holds the first request in the new
+             * domain for the whole stale offset. */
+            for (i = 0; i < s->if_count; i++)
+                s->arp.last_arp[i] = 0;
+        }
 #endif
+    }
 
     s->last_tick = now;
 

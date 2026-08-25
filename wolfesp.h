@@ -109,15 +109,19 @@ typedef struct wolfIP_esp_sa wolfIP_esp_sa;
  * The read callback is invoked when a new SA is created, keyed by SPI.
  * It may fill the (fresh) oseq/hi_seq/bitmap values with persisted state.
  * Return 0 if state was restored, anything else to start the SA fresh.
+ *
+ * The bitmap is the full 64-bit inbound replay window
+ * (ESP_REPLAY_WIN); persisting only half of it lets a duplicate in the
+ * upper half of the window be accepted after a restore.
  * */
 typedef int (*wolfIP_esp_state_write_cb)(const uint8_t *spi,
                                          uint32_t oseq,
                                          uint32_t hi_seq,
-                                         uint32_t bitmap);
+                                         uint64_t bitmap);
 typedef int (*wolfIP_esp_state_read_cb)(const uint8_t *spi,
                                         uint32_t *oseq,
                                         uint32_t *hi_seq,
-                                        uint32_t *bitmap);
+                                        uint64_t *bitmap);
 int  wolfIP_esp_state_set_cbs(wolfIP_esp_state_write_cb write,
                               wolfIP_esp_state_read_cb read);
 

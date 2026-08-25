@@ -61,7 +61,7 @@ esp_state_restore(wolfIP_esp_sa *sa)
 {
     uint32_t oseq;
     uint32_t hi_seq;
-    uint32_t bitmap;
+    uint64_t bitmap;
 
     if (esp_state_read_cb) {
         oseq   = sa->replay.oseq;

@@ -661,6 +661,176 @@ START_TEST(test_ip_recv_l2_broadcast_frame_not_forwarded)
 END_TEST
 
 /* =========================================================================
+ * F-11438: a non-local datagram that is not forwarded must not fall
+ * through to local protocol dispatch.
+ * =========================================================================
+ * The UDP RECEIVING filter notification fires inside udp_try_recv, before
+ * socket matching, so it observes whether a datagram reached local
+ * dispatch at all.
+ */
+static int f11438_udp_rx_seen;
+
+static int f11438_filter_cb(void *arg, const struct wolfIP_filter_event *ev)
+{
+    (void)arg;
+    if (ev->reason == WOLFIP_FILT_RECEIVING &&
+            ev->meta.ip_proto == WOLFIP_FILTER_PROTO_UDP)
+        f11438_udp_rx_seen++;
+    return 0; /* allow */
+}
+
+static void f11438_install_rx_observer(void)
+{
+    f11438_udp_rx_seen = 0;
+    wolfIP_filter_set_callback(f11438_filter_cb, NULL);
+    wolfIP_filter_set_udp_mask(WOLFIP_FILT_MASK(WOLFIP_FILT_RECEIVING));
+}
+
+static void f11438_uninstall_rx_observer(void)
+{
+    wolfIP_filter_set_callback(NULL, NULL);
+}
+
+/* Unicast L2 frame, non-local destination, no connected or static route:
+ * the router must drop it (RFC 1122 sec.4.2.2.9), not hand it to its own
+ * UDP/TCP/ICMP handlers. (The ICMP Network Unreachable reply is a separate
+ * concern — F-1332, wont_fix — and is intentionally not asserted here.) */
+START_TEST(test_ip_recv_forward_no_route_dropped_not_dispatched)
+{
+    struct wolfIP s;
+    uint8_t frame[ETH_HEADER_LEN + IP_HEADER_LEN + UDP_HEADER_LEN];
+    struct wolfIP_ip_packet *ip = (struct wolfIP_ip_packet *)frame;
+    ip4 primary_ip   = 0x0A000001U;
+    ip4 secondary_ip = 0xC0A80101U;
+    ip4 src_ip       = 0x0A000002U;   /* 10.0.0.2 passes every RPF check */
+    ip4 dest_ip      = 0xAC100505U;   /* 172.16.5.5 — non-local, no route */
+
+    setup_stack_with_two_ifaces(&s, primary_ip, secondary_ip);
+    f11438_install_rx_observer();
+
+    memset(frame, 0, sizeof(frame));
+    memcpy(ip->eth.dst, s.ll_dev[TEST_PRIMARY_IF].mac, 6);
+    memcpy(ip->eth.src, "\x01\x02\x03\x04\x05\x06", 6);
+    ip->eth.type = ee16(ETH_TYPE_IP);
+    ip->ver_ihl  = 0x45;
+    ip->ttl      = 64;
+    ip->proto    = WI_IPPROTO_UDP;
+    ip->len      = ee16(IP_HEADER_LEN + UDP_HEADER_LEN);
+    ip->src      = ee32(src_ip);
+    ip->dst      = ee32(dest_ip);
+    fix_ip_checksum(ip);
+    {
+        uint16_t *udp = (uint16_t *)(frame + ETH_HEADER_LEN + IP_HEADER_LEN);
+        udp[0] = ee16(9999); udp[1] = ee16(1234);
+        udp[2] = ee16(UDP_HEADER_LEN); udp[3] = 0;
+    }
+
+    last_frame_sent_size = 0;
+    ip_recv(&s, TEST_PRIMARY_IF, ip, (uint32_t)sizeof(frame));
+
+    /* Nothing forwarded, nothing queued behind an ARP resolution... */
+    ck_assert_uint_eq(last_frame_sent_size, 0);
+    ck_assert_uint_eq(s.arp_pending[0].dest, IPADDR_ANY);
+    /* ...and the datagram never reaches local UDP dispatch. */
+    ck_assert_int_eq(f11438_udp_rx_seen, 0);
+
+    f11438_uninstall_rx_observer();
+}
+END_TEST
+
+/* L2-broadcast frame carrying a unicast ip.dst that is not locally
+ * deliverable (not IGMP, not 224/4 multicast, not DHCP 67->68): RFC 1812
+ * sec.5.3.4 forbids forwarding it, and it is not addressed to this node,
+ * so it must be discarded — not passed to local protocol dispatch. */
+START_TEST(test_ip_recv_l2_group_not_locally_deliverable_dropped)
+{
+    struct wolfIP s;
+    uint8_t frame[ETH_HEADER_LEN + IP_HEADER_LEN + UDP_HEADER_LEN];
+    struct wolfIP_ip_packet *ip = (struct wolfIP_ip_packet *)frame;
+    ip4 primary_ip   = 0x0A000001U;
+    ip4 secondary_ip = 0xC0A80101U;
+    ip4 src_ip       = 0x0A000002U;   /* 10.0.0.2 passes every RPF check */
+    ip4 dest_ip      = 0xAC100505U;   /* 172.16.5.5 — non-local unicast */
+
+    setup_stack_with_two_ifaces(&s, primary_ip, secondary_ip);
+    f11438_install_rx_observer();
+
+    memset(frame, 0, sizeof(frame));
+    memcpy(ip->eth.dst, "\xff\xff\xff\xff\xff\xff", 6);
+    memcpy(ip->eth.src, "\x01\x02\x03\x04\x05\x06", 6);
+    ip->eth.type = ee16(ETH_TYPE_IP);
+    ip->ver_ihl  = 0x45;
+    ip->ttl      = 64;
+    ip->proto    = WI_IPPROTO_UDP;
+    ip->len      = ee16(IP_HEADER_LEN + UDP_HEADER_LEN);
+    ip->src      = ee32(src_ip);
+    ip->dst      = ee32(dest_ip);
+    fix_ip_checksum(ip);
+    {
+        uint16_t *udp = (uint16_t *)(frame + ETH_HEADER_LEN + IP_HEADER_LEN);
+        udp[0] = ee16(9999); udp[1] = ee16(1234);
+        udp[2] = ee16(UDP_HEADER_LEN); udp[3] = 0;
+    }
+
+    last_frame_sent_size = 0;
+    wolfIP_recv_on(&s, TEST_PRIMARY_IF, frame, (uint32_t)sizeof(frame));
+
+    /* Not forwarded (RFC 1812 sec.5.3.4), not queued, not dispatched. */
+    ck_assert_uint_eq(last_frame_sent_size, 0);
+    ck_assert_uint_eq(s.arp_pending[0].dest, IPADDR_ANY);
+    ck_assert_int_eq(f11438_udp_rx_seen, 0);
+
+    f11438_uninstall_rx_observer();
+}
+END_TEST
+
+/* Guard: the L2-group fall-through exists to deliver DHCPOFFER/ACK, which
+ * arrive L2-broadcast carrying an ip.dst the client does not own yet
+ * (RFC 2131). A UDP 67->68 broadcast datagram must still reach local UDP
+ * dispatch after the F-11438 drop is in place. */
+START_TEST(test_ip_recv_l2_group_dhcp_still_reaches_local_udp)
+{
+    struct wolfIP s;
+    uint8_t frame[ETH_HEADER_LEN + IP_HEADER_LEN + UDP_HEADER_LEN];
+    struct wolfIP_ip_packet *ip = (struct wolfIP_ip_packet *)frame;
+    ip4 primary_ip   = 0x0A000001U;
+    ip4 secondary_ip = 0xC0A80101U;
+    ip4 src_ip       = 0x0A000002U;
+    ip4 dest_ip      = 0x0A000063U;   /* 10.0.0.99 — not yet ours */
+
+    setup_stack_with_two_ifaces(&s, primary_ip, secondary_ip);
+    f11438_install_rx_observer();
+
+    memset(frame, 0, sizeof(frame));
+    memcpy(ip->eth.dst, "\xff\xff\xff\xff\xff\xff", 6);
+    memcpy(ip->eth.src, "\x01\x02\x03\x04\x05\x06", 6);
+    ip->eth.type = ee16(ETH_TYPE_IP);
+    ip->ver_ihl  = 0x45;
+    ip->ttl      = 64;
+    ip->proto    = WI_IPPROTO_UDP;
+    ip->len      = ee16(IP_HEADER_LEN + UDP_HEADER_LEN);
+    ip->src      = ee32(src_ip);
+    ip->dst      = ee32(dest_ip);
+    fix_ip_checksum(ip);
+    {
+        uint16_t *udp = (uint16_t *)(frame + ETH_HEADER_LEN + IP_HEADER_LEN);
+        udp[0] = ee16(67); udp[1] = ee16(68);   /* DHCP server -> client */
+        udp[2] = ee16(UDP_HEADER_LEN); udp[3] = 0;
+    }
+
+    last_frame_sent_size = 0;
+    wolfIP_recv_on(&s, TEST_PRIMARY_IF, frame, (uint32_t)sizeof(frame));
+
+    /* Never forwarded... */
+    ck_assert_uint_eq(last_frame_sent_size, 0);
+    /* ...but still dispatched to local UDP (the DHCP socket path). */
+    ck_assert_int_eq(f11438_udp_rx_seen, 1);
+
+    f11438_uninstall_rx_observer();
+}
+END_TEST
+
+/* =========================================================================
  * ip_recv: IP with NOP options — options parsed, payload delivered
  * =========================================================================
  * Branch: type == 1 (NOP) inside option parser → opt++ continue
