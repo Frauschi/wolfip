@@ -6612,12 +6612,84 @@ int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *add
         ts = &s->tcpsockets[SOCKET_UNMARK(sockfd)];
         if (ts->sock.tcp.state == TCP_ESTABLISHED &&
                 ts->sock.tcp.is_listener) {
-            /* The handshake completed before accept(): the connection can
-             * no longer be cloned (accept() only handles SYN_RCVD), and
-             * without this recovery the port would be pinned in
-             * ESTABLISHED forever. Revert the port to LISTEN. */
+            /* The handshake completed before accept() was called.
+             *
+             * This is an ordinary race, not an exotic one: the stack finishes
+             * the handshake from its own context, so any application that is
+             * not already blocked in accept() when the final ACK arrives ends
+             * up here. A server looping accept() -> serve -> close hits it on
+             * roughly every other connection, because it is busy finishing the
+             * previous one exactly when the next handshake completes.
+             *
+             * This used to revert the listener and return -1, which silently
+             * DESTROYED a fully established connection: the peer had completed
+             * its handshake and considered itself connected, its data was
+             * acknowledged into this socket's receive buffer, and then nothing
+             * ever served it. No RST and no FIN went out, so the peer sat until
+             * its own timeout. The application saw accept() fail, or - once it
+             * did get a socket - a recv() of 0, which BSD semantics make
+             * indistinguishable from an orderly close by the peer.
+             *
+             * Clone it instead. The connection is already up, so unlike the
+             * SYN_RCVD path below there is no SYN-ACK to send; what has to move
+             * across is the whole TCP state plus any payload that already
+             * arrived. */
+            newts = tcp_new_socket(s);
+            if (!newts) {
+                /* No socket free. Fall back to the old behaviour rather than
+                 * leaving the port pinned in ESTABLISHED: the connection is
+                 * lost either way, but the listener stays usable. */
+                tcp_listener_revert_to_listen(ts);
+                return -1;
+            }
+            newts->callback = ts->callback;
+            newts->callback_arg = ts->callback_arg;
+            newts->local_ip = ts->local_ip;
+            newts->bound_local_ip = (ts->bound_local_ip != IPADDR_ANY) ?
+                    ts->bound_local_ip : ts->local_ip;
+            newts->if_idx = ts->if_idx;
+            newts->remote_ip = ts->remote_ip;
+            newts->src_port = ts->src_port;
+            newts->dst_port = ts->dst_port;
+
+            /* Take the connection state wholesale - sequence numbers, window
+             * scaling, timestamps, congestion state - then re-home the buffer
+             * bookkeeping onto the clone's own storage, carrying the bytes
+             * with it. Copying the memory rather than re-initialising the
+             * queues is what preserves data the peer already sent and this
+             * stack already acknowledged. */
+            newts->sock.tcp = ts->sock.tcp;
+            newts->sock.tcp.is_listener = 0;
+            memcpy(newts->rxmem, ts->rxmem, RXBUF_SIZE);
+            memcpy(newts->txmem, ts->txmem, TXBUF_SIZE);
+            newts->sock.tcp.rxbuf.data = newts->rxmem;
+            newts->sock.tcp.txbuf.data = newts->txmem;
+
+            /* The connection is established, so it is writable immediately -
+             * and readable if the peer's data beat accept() here too. */
+            newts->events = CB_EVENT_WRITABLE;
+            if (queue_len(&newts->sock.tcp.rxbuf) > 0)
+                newts->events |= CB_EVENT_READABLE;
+
+            /* Fill the peer address before reverting the listener: the revert
+             * clears remote_ip and dst_port. */
+            if (sin) {
+                sin->sin_family = AF_INET;
+                sin->sin_port = ee16(ts->dst_port);
+                sin->sin_addr.s_addr = ee32(ts->remote_ip);
+            }
+
+            tcp_ctrl_rto_stop(ts);
             tcp_listener_revert_to_listen(ts);
-            return -1;
+
+            if (wolfIP_filter_notify_socket_event(
+                    WOLFIP_FILT_ACCEPTING, s, newts,
+                    newts->local_ip, newts->src_port,
+                    newts->remote_ip, newts->dst_port) != 0) {
+                close_socket(newts);
+                return -1;
+            }
+            return (newts - s->tcpsockets) | MARK_TCP_SOCKET;
         }
         if ((ts->sock.tcp.state != TCP_SYN_RCVD) && (ts->sock.tcp.state != TCP_LISTEN))
             return -1;
