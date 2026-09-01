@@ -37,13 +37,18 @@
 #define WOLFIP_FREERTOS_BSD_MAX_FDS 16
 #endif
 
-#ifndef WOLFIP_FREERTOS_POLL_MAX_MS
-#define WOLFIP_FREERTOS_POLL_MAX_MS 20u
+/* Timer fallback for the poll task: how long it waits when nothing has kicked
+ * it. Sockets signal it directly when they queue data (see wolfip_bsd_kick),
+ * so this only bounds how long an unsolicited receive or a retransmit timer
+ * can sit unserviced - it is not the rate at which the stack does its work.
+ *
+ * This replaces a WOLFIP_FREERTOS_POLL_MIN_MS / _MAX_MS pair that clamped a
+ * value which was never a delay to begin with; see the poll task. */
+#ifndef WOLFIP_FREERTOS_POLL_INTERVAL_MS
+#define WOLFIP_FREERTOS_POLL_INTERVAL_MS 5u
 #endif
 
-#ifndef WOLFIP_FREERTOS_POLL_MIN_MS
-#define WOLFIP_FREERTOS_POLL_MIN_MS 5u
-#endif
+
 
 typedef struct {
     int in_use;
@@ -55,41 +60,62 @@ typedef struct {
 
 static struct wolfIP *g_ipstack;
 static SemaphoreHandle_t g_lock;
+static SemaphoreHandle_t g_kick;
 static wolfip_bsd_fd_entry g_fds[WOLFIP_FREERTOS_BSD_MAX_FDS];
 static int g_last_error;
 static volatile uint32_t g_cb_log_count;
 
+/* Wake the poll task now rather than at the next timer expiry.
+ *
+ * Called after a socket operation queues something the stack has to put on the
+ * wire. Without it, data sits in the socket buffer until the poll task's timer
+ * happens to fire, which adds up to a full poll interval of latency to every
+ * single exchange - the dominant cost in a request/response protocol.
+ *
+ * Safe to call redundantly: the semaphore is binary, so a give while it is
+ * already available is a no-op, and a spurious wake just runs a poll cycle
+ * that finds nothing to do. */
+static void wolfip_bsd_kick(void)
+{
+    if (g_kick != NULL) {
+        (void)xSemaphoreGive(g_kick);
+    }
+}
+
 static void wolfip_bsd_poll_task(void *arg)
 {
     struct wolfIP *ipstack = (struct wolfIP *)arg;
+    TickType_t     interval = pdMS_TO_TICKS(WOLFIP_FREERTOS_POLL_INTERVAL_MS);
+
+    if (interval == 0) {
+        interval = 1;          /* the tick is the finest this can resolve */
+    }
 
     for (;;) {
-        uint32_t next_ms;
-        TickType_t delay_ticks;
         uint64_t now_ms = (uint64_t)xTaskGetTickCount() * (uint64_t)portTICK_PERIOD_MS;
+        int      rc;
 
         /* Run one wolfIP poll cycle under the global lock so socket operations
          * and timer processing see a consistent core state. */
         xSemaphoreTake(g_lock, portMAX_DELAY);
-        next_ms = (uint32_t)wolfIP_poll(ipstack, now_ms);
+        rc = wolfIP_poll(ipstack, now_ms);
         xSemaphoreGive(g_lock);
 
-        /* Bound sleep time to keep progress predictable and to avoid either
-         * spinning too fast or sleeping too long when no timers are pending. */
-        if (next_ms < WOLFIP_FREERTOS_POLL_MIN_MS) {
-            next_ms = WOLFIP_FREERTOS_POLL_MIN_MS;
-        }
-        if (next_ms > WOLFIP_FREERTOS_POLL_MAX_MS) {
-            next_ms = WOLFIP_FREERTOS_POLL_MAX_MS;
-        }
+        /* wolfIP_poll returns a STATUS - 0, or a negative error - not a delay
+         * until the next timer. This used to be assigned to an unsigned
+         * "next_ms" and clamped between a MIN and a MAX, which meant the sleep
+         * was always exactly MIN and the MAX was unreachable. A negative error
+         * would have cast to a huge unsigned and clamped to MAX, so a failing
+         * poll would have polled more slowly. There is nothing to derive a
+         * sleep from here; the wait below is a plain timer fallback. */
+        (void)rc;
 
-        /* Convert milliseconds to RTOS ticks and always sleep at least one tick
-         * so the poll task yields CPU time to application tasks. */
-        delay_ticks = pdMS_TO_TICKS(next_ms);
-        if (delay_ticks == 0) {
-            delay_ticks = 1;
-        }
-        vTaskDelay(delay_ticks);
+        /* Block until a socket has something to send or the fallback expires.
+         * Blocking matters as much as waking: this task runs at a HIGHER
+         * priority than the application tasks it serves, so it is only while
+         * it is blocked that they get to run at all. Spinning or yielding here
+         * instead would starve them outright. */
+        (void)xSemaphoreTake(g_kick, interval);
     }
 }
 
@@ -238,6 +264,14 @@ int wolfip_freertos_socket_init(struct wolfIP *ipstack,
         return -WOLFIP_ENOMEM;
     }
 
+    /* Binary, so redundant kicks collapse into one pending wake. */
+    g_kick = xSemaphoreCreateBinary();
+    if (g_kick == NULL) {
+        vSemaphoreDelete(g_lock);
+        g_lock = NULL;
+        return -WOLFIP_ENOMEM;
+    }
+
     for (i = 0; i < WOLFIP_FREERTOS_BSD_MAX_FDS; i++) {
         g_fds[i].in_use = 0;
         g_fds[i].internal_fd = -1;
@@ -252,6 +286,8 @@ int wolfip_freertos_socket_init(struct wolfIP *ipstack,
     if (xTaskCreate(wolfip_bsd_poll_task, "wolfip_poll", poll_task_stack_words,
             g_ipstack, poll_task_priority, NULL) != pdPASS) {
         g_ipstack = NULL;
+        vSemaphoreDelete(g_kick);
+        g_kick = NULL;
         vSemaphoreDelete(g_lock);
         g_lock = NULL;
         return -WOLFIP_ENOMEM;
@@ -436,6 +472,7 @@ int connect(int sockfd, const struct wolfIP_sockaddr *addr, socklen_t addrlen)
         ret = wolfIP_sock_connect(g_ipstack, entry->internal_fd, addr, addrlen);
         if (ret == 0) {
             xSemaphoreGive(g_lock);
+            wolfip_bsd_kick();
             return 0;
         }
         if (ret != -WOLFIP_EAGAIN) {
@@ -444,8 +481,11 @@ int connect(int sockfd, const struct wolfIP_sockaddr *addr, socklen_t addrlen)
             return -1;
         }
 
+        /* EAGAIN means the handshake is under way, so the SYN still needs to
+         * go out before this thread's wait can ever be satisfied. */
         wolfip_bsd_prepare_wait_locked(entry, (uint16_t)(CB_EVENT_WRITABLE | CB_EVENT_CLOSED));
         xSemaphoreGive(g_lock);
+        wolfip_bsd_kick();
         if (wolfip_bsd_wait_unlocked(entry) < 0) {
             wolfip_bsd_set_error(WOLFIP_EAGAIN);
             return -1;
@@ -469,6 +509,7 @@ int send(int sockfd, const void *buf, size_t len, int flags)
         ret = wolfIP_sock_send(g_ipstack, entry->internal_fd, buf, len, flags);
         if (ret >= 0) {
             xSemaphoreGive(g_lock);
+            wolfip_bsd_kick();      /* queued - put it on the wire now */
             return ret;
         }
         if (wolfip_bsd_tcp_stream_retryable_once(entry->internal_fd, ret,
@@ -514,6 +555,7 @@ int sendto(int sockfd, const void *buf, size_t len, int flags,
         ret = wolfIP_sock_sendto(g_ipstack, entry->internal_fd, buf, len, flags, dest_addr, addrlen);
         if (ret >= 0) {
             xSemaphoreGive(g_lock);
+            wolfip_bsd_kick();      /* queued - put it on the wire now */
             return ret;
         }
         if (wolfip_bsd_tcp_stream_retryable_once(entry->internal_fd, ret,
@@ -712,6 +754,7 @@ int close(int sockfd)
             wolfIP_register_callback(g_ipstack, entry->internal_fd, NULL, NULL);
             wolfip_bsd_fd_free(sockfd);
             xSemaphoreGive(g_lock);
+            wolfip_bsd_kick();      /* the FIN still has to go out */
             return ret;
         }
         if ((ret == -1) && IS_SOCKET_TCP(entry->internal_fd) &&
