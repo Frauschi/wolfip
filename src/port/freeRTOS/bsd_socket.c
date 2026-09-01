@@ -60,7 +60,7 @@ typedef struct {
 
 static struct wolfIP *g_ipstack;
 static SemaphoreHandle_t g_lock;
-static SemaphoreHandle_t g_kick;
+static TaskHandle_t g_poll_task;
 static wolfip_bsd_fd_entry g_fds[WOLFIP_FREERTOS_BSD_MAX_FDS];
 static int g_last_error;
 static volatile uint32_t g_cb_log_count;
@@ -77,8 +77,8 @@ static volatile uint32_t g_cb_log_count;
  * that finds nothing to do. */
 static void wolfip_bsd_kick(void)
 {
-    if (g_kick != NULL) {
-        (void)xSemaphoreGive(g_kick);
+    if (g_poll_task != NULL) {
+        xTaskNotifyGive(g_poll_task);
     }
 }
 
@@ -114,8 +114,16 @@ static void wolfip_bsd_poll_task(void *arg)
          * Blocking matters as much as waking: this task runs at a HIGHER
          * priority than the application tasks it serves, so it is only while
          * it is blocked that they get to run at all. Spinning or yielding here
-         * instead would starve them outright. */
-        (void)xSemaphoreTake(g_kick, interval);
+         * instead would starve them outright.
+         *
+         * A task notification rather than a semaphore: it needs no separate
+         * object, is cheaper on both sides, and - the reason it is worth
+         * choosing here - has an ISR-safe counterpart in
+         * vTaskNotifyGiveFromISR, so a link driver with a receive
+         * interrupt can wake this task the same way a socket does. Clearing
+         * on exit makes it behave exactly like the binary semaphore it
+         * replaces: several gives before a take collapse into one wake. */
+        (void)ulTaskNotifyTake(pdTRUE, interval);
     }
 }
 
@@ -264,14 +272,6 @@ int wolfip_freertos_socket_init(struct wolfIP *ipstack,
         return -WOLFIP_ENOMEM;
     }
 
-    /* Binary, so redundant kicks collapse into one pending wake. */
-    g_kick = xSemaphoreCreateBinary();
-    if (g_kick == NULL) {
-        vSemaphoreDelete(g_lock);
-        g_lock = NULL;
-        return -WOLFIP_ENOMEM;
-    }
-
     for (i = 0; i < WOLFIP_FREERTOS_BSD_MAX_FDS; i++) {
         g_fds[i].in_use = 0;
         g_fds[i].internal_fd = -1;
@@ -284,10 +284,9 @@ int wolfip_freertos_socket_init(struct wolfIP *ipstack,
     g_cb_log_count = 0;
 
     if (xTaskCreate(wolfip_bsd_poll_task, "wolfip_poll", poll_task_stack_words,
-            g_ipstack, poll_task_priority, NULL) != pdPASS) {
+            g_ipstack, poll_task_priority, &g_poll_task) != pdPASS) {
         g_ipstack = NULL;
-        vSemaphoreDelete(g_kick);
-        g_kick = NULL;
+        g_poll_task = NULL;
         vSemaphoreDelete(g_lock);
         g_lock = NULL;
         return -WOLFIP_ENOMEM;
