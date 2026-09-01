@@ -153,6 +153,13 @@ static void wolfip_bsd_fd_free(int public_fd)
     g_fds[public_fd].seen_events = 0;
 }
 
+/* How long accept() will wait for a freshly cloned connection to finish its
+ * handshake, in scheduler ticks. Generous against an RTT and stingy against a
+ * peer that sends SYN and disappears. */
+#ifndef WOLFIP_BSD_ACCEPT_ESTABLISH_TICKS
+#define WOLFIP_BSD_ACCEPT_ESTABLISH_TICKS (pdMS_TO_TICKS(2000))
+#endif
+
 static void wolfip_bsd_socket_cb(int internal_fd, uint16_t events, void *arg)
 {
     wolfip_bsd_fd_entry *entry = (wolfip_bsd_fd_entry *)arg;
@@ -338,6 +345,53 @@ int accept(int sockfd, struct wolfIP_sockaddr *addr, socklen_t *addrlen)
                 xSemaphoreGive(g_lock);
                 wolfip_bsd_set_error(public_fd);
                 return -1;
+            }
+
+            /* POSIX accept() returns a CONNECTED socket. wolfIP_sock_accept()
+             * returns as soon as it has cloned the connection, which is before
+             * the peer's final ACK: the clone is in SYN_RCVD, and the core
+             * deliberately withholds CB_EVENT_WRITABLE until it establishes.
+             *
+             * Handing that straight to the caller loses the race whenever the
+             * caller reads immediately - which a TLS server does, because
+             * wolfSSL_accept() goes straight for the ClientHello. The read
+             * lands on a socket that is not established, wolfIP_sock_recvfrom
+             * reports it, and the application sees a connection that closed
+             * before it began.
+             *
+             * Waiting on CB_EVENT_WRITABLE would be the natural thing, but the
+             * clone inherits callback_arg from the LISTENER, so an event
+             * dispatched before this layer re-registers goes to the wrong fd
+             * entry and the wait never wakes. Polling the state is immune to
+             * that ordering.
+             *
+             * The bound matters: a peer that sends SYN and then vanishes must
+             * not pin the accept loop. On expiry the half-open socket is
+             * dropped and the loop goes back to waiting, which is what a
+             * server wants - the connection was never usable. */
+            {
+                unsigned spins;
+                int      st = 0;
+
+                for (spins = 0; spins < WOLFIP_BSD_ACCEPT_ESTABLISH_TICKS;
+                     spins++) {
+                    xSemaphoreTake(g_lock, portMAX_DELAY);
+                    st = wolfIP_sock_is_connected(g_ipstack,
+                            g_fds[public_fd].internal_fd);
+                    xSemaphoreGive(g_lock);
+                    if (st != 0) {
+                        break;
+                    }
+                    vTaskDelay(1);
+                }
+                if (st != 1) {
+                    /* Never established, or died while we waited. Dropping it
+                     * here rather than in the application keeps the failure
+                     * where it belongs: accept() simply did not produce a
+                     * connection, so the loop goes back to waiting for one. */
+                    (void)close(public_fd);
+                    continue;
+                }
             }
             return public_fd;
         }

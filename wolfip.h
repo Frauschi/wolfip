@@ -431,6 +431,17 @@ int wolfIP_sock_bind(struct wolfIP *s, int sockfd, const struct wolfIP_sockaddr 
 int wolfIP_sock_listen(struct wolfIP *s, int sockfd, int backlog);
 int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *addr,
                        socklen_t *addrlen);
+
+/* Is an accepted stream socket connected yet?
+ *
+ * wolfIP_sock_accept() returns as soon as it has cloned the connection, which
+ * is BEFORE the peer's final ACK has been seen - the clone is in SYN_RCVD and
+ * the core deliberately withholds CB_EVENT_WRITABLE until it is established.
+ * A caller that reads immediately therefore races the handshake.
+ *
+ * Returns 1 when established, 0 while the handshake is still completing, and
+ * -1 for a bad descriptor or a socket that has since closed. */
+int wolfIP_sock_is_connected(struct wolfIP *s, int sockfd);
 int wolfIP_sock_connect(struct wolfIP *s, int sockfd, const struct wolfIP_sockaddr *addr,
                         socklen_t addrlen);
 int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len,

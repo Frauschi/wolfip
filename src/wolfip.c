@@ -6588,6 +6588,36 @@ int wolfIP_sock_connect(struct wolfIP *s, int sockfd, const struct wolfIP_sockad
     return -WOLFIP_EINVAL;
 }
 
+int wolfIP_sock_is_connected(struct wolfIP *s, int sockfd)
+{
+    struct tsocket *ts;
+
+    if (!s || sockfd < 0 || !IS_SOCKET_TCP(sockfd))
+        return -1;
+    if (SOCKET_UNMARK(sockfd) >= MAX_TCPSOCKETS)
+        return -1;
+    ts = &s->tcpsockets[SOCKET_UNMARK(sockfd)];
+
+    switch (ts->sock.tcp.state) {
+        case TCP_ESTABLISHED:
+            return 1;
+        case TCP_SYN_SENT:
+        case TCP_SYN_RCVD:
+            return 0;      /* still handshaking */
+        default:
+            /* Everything else - CLOSE_WAIT, the FIN_WAITs, CLOSING, LAST_ACK,
+             * TIME_WAIT, CLOSED, LISTEN - is not a usable new connection.
+             *
+             * Counting the half-closed states as connected would be defensible
+             * for a general "may I still read this?" query, since there can be
+             * buffered data left. It is wrong for the caller this exists for:
+             * a socket that reaches CLOSE_WAIT during its own handshake never
+             * carried a connection at all, and handing it to an application
+             * that immediately reads just moves the failure one layer up. */
+            return -1;
+    }
+}
+
 int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *addr, socklen_t *addrlen)
 {
     struct tsocket *ts;
