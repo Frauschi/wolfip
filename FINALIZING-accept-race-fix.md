@@ -4,8 +4,15 @@
 on top of the fix so it can be dropped before the patch is sent: take the fix
 commit alone with `git format-patch`, and leave this one behind.
 
-The fix itself is commit `tcp: don't destroy a connection whose handshake beat
-accept()`. What follows is what is still owed before it should go to the wolfIP
+There are now TWO fix commits and ONE unresolved defect:
+
+1. `tcp: don't destroy a connection whose handshake beat accept()` - validated
+   on hardware, 120/120. Ready to upstream.
+2. `tcp: accept() must not return a socket that is still handshaking` -
+   correct, but NOT sufficient on its own. See "The unresolved defect" below.
+3. TLS handshakes still fail roughly half the time, cause unknown.
+
+What follows is what is still owed before any of this goes to the wolfIP
 maintainers, and the context needed to finish it on another machine.
 
 ## What is already established
@@ -29,6 +36,70 @@ independent pieces of evidence agree on the cause:
 After the fix, on the same board: 16/16 rapid, 4/4 across two connections with
 two round trips each, 12/12 across a gap sweep from 0 to 3000 ms, and 120/120
 over three payload sizes from 10 to 460 bytes, with ping at 0% loss throughout.
+
+## The second defect: accept() returned an unconnected socket
+
+`wolfIP_sock_accept()` returns as soon as it has cloned the connection. The
+clone is in `SYN_RCVD`, before the peer's final ACK, and the core knows it - it
+clears `CB_EVENT_WRITABLE` at the clone site with the comment *"Don't signal
+writable until connection fully established"*. The FreeRTOS BSD wrapper then
+handed that descriptor straight to the application.
+
+A plaintext echo server tolerates this: by the time it calls `recv()` the ACK
+has usually arrived. A TLS server does not, because `wolfSSL_accept()` goes
+straight for the ClientHello. The symptom was `recv()` returning 0 on a
+connection the peer had not closed, surfacing as wolfSSL error -308.
+
+Fixed by `wolfIP_sock_is_connected()` plus a bounded poll in `accept()`.
+Measured on a TC4Dx, accept() never once returned an unestablished socket over
+several dozen TLS connections and never hit its timeout - so the fix does what
+it says. It did NOT change the TLS failure rate.
+
+## The unresolved defect
+
+TLS 1.3 handshakes against this stack fail roughly 50 to 70 percent of the
+time, in no stable pattern. Everything below is measured, not inferred.
+
+**Server side**, per failing connection: `accept()` returns an established
+socket, the application calls `recv()`, no data ever arrives, and the socket
+reports closed. The ClientHello never reaches the accepted socket.
+
+**Client side**: `wolfSSL_connect error -311, unknown type in record hdr`. The
+client reads bytes that are not a valid TLS record header. So the server does
+put something on the wire, and it is malformed or misframed.
+
+**The lead worth following.** In the socket-callback trace the LISTENING
+descriptor is seen going READABLE and then CLOSED:
+
+    [sock_cb] ifd=256 events=0x0001 ...   <- listener READABLE
+    [sock_cb] ifd=256 events=0x0010 ...   <- listener CLOSED
+    [sock_cb] ifd=257 events=0x0010 ...   <- the accepted socket, closed
+
+`ifd=256` is the listener; `257` is the accepted clone. A listening socket has
+no business becoming readable or closed. That is consistent with inbound
+segments for an established connection being matched to the listener instead of
+the clone, which would explain both halves at once: the clone starves while the
+client receives something it cannot frame. `tcp_input`'s socket-matching loop
+is where to look - it matches on local port first, then discriminates by state
+and 4-tuple, and the listener's tuple is wildcarded back to ANY when it reverts.
+
+**Also unexplained.** After a few dozen connections the board began refusing
+new ones outright while still answering ping: the listener stops accepting.
+`MAX_TCPSOCKETS` was 4 in that configuration, and this stack has a
+`TCP_TIME_WAIT` state but no 2MSL timer that returns those sockets to the pool.
+Sustained connection churn exhausting a small socket table would look exactly
+like this. Worth confirming, because if true it is a separate defect from the
+matching problem above and would bite any long-running server.
+
+**Ruled out**, each checked directly rather than assumed:
+
+- Not the driver or the link: ping stayed at 0 percent loss throughout, and the
+  MAC, PHY and DMA rings are exercised continuously by the same traffic.
+- Not stale socket buffers on reuse: `tcp_new_socket()` re-initialises both the
+  TX fifo and the RX queue.
+- Not the TLS layer: every connection that does get a usable socket completes a
+  genuine TLS 1.3 handshake, TLS_AES_128_GCM_SHA256 over SECP256R1.
+- Not accept() returning unconnected sockets: fixed, verified, rate unchanged.
 
 ## Still to do
 
@@ -90,7 +161,16 @@ transmitted a frame even with ARP primed. Whatever else the mock link needs was
 not identified. Worth a few minutes before writing the test proper, because a
 harness that cannot transmit cannot exercise this path at all.
 
-### 3. Regression-check the existing suites
+### 3. Find the remaining defect
+
+This is the blocking item and it will not be solved by inspection - four
+successive hypotheses about it were contradicted by the next hardware run. It
+needs a host harness that can actually drive a full handshake, which is also
+what item 2 needs. Instrument `tcp_input`'s socket-matching loop to log which
+socket each inbound segment is matched to, and check whether data for an
+established connection is ever delivered to the listener.
+
+### 4. Regression-check the existing suites
 
 Neither was run on the machine where the fix was made:
 
