@@ -82,6 +82,26 @@ static void wolfip_bsd_kick(void)
     }
 }
 
+/* ISR-safe wake, for a link driver whose receive path is interrupt driven.
+ *
+ * Without it, an arriving frame waits for the poll task's timer, so every
+ * frame in a transfer costs up to a full interval - the dominant latency on a
+ * platform that polls. A driver that has a receive interrupt can call this
+ * from it and the frame is serviced immediately instead.
+ *
+ * Safe to call when the socket layer has not been initialised: the handle is
+ * NULL until then and this does nothing. */
+void wolfip_freertos_notify_from_isr(void)
+{
+    BaseType_t woken = pdFALSE;
+
+    if (g_poll_task == NULL) {
+        return;
+    }
+    vTaskNotifyGiveFromISR(g_poll_task, &woken);
+    portYIELD_FROM_ISR(woken);
+}
+
 static void wolfip_bsd_poll_task(void *arg)
 {
     struct wolfIP *ipstack = (struct wolfIP *)arg;

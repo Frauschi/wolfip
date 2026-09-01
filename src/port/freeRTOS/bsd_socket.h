@@ -65,4 +65,12 @@ int getpeername(int sockfd, struct wolfIP_sockaddr *addr, socklen_t *addrlen);
 }
 #endif
 
+/* Wake the wolfIP poll task from an interrupt.
+ *
+ * For link drivers with a receive interrupt: call this from the ISR after
+ * clearing the source, and an arriving frame is serviced immediately instead
+ * of waiting out the poll task's timer. Does nothing before
+ * wolfip_freertos_socket_init() has run. */
+void wolfip_freertos_notify_from_isr(void);
+
 #endif /* WOLFIP_FREERTOS_SOCKET_H */
