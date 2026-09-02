@@ -1485,6 +1485,10 @@ struct wolfIP {
     char dns_ptr_name[256];
     struct timers_binheap timers;
     struct tsocket tcpsockets[MAX_TCPSOCKETS];
+    /* MAX_UDPSOCKETS may be 0: every access is already preceded by its own
+     * bound check, so each UDP path becomes unreachable rather than unsafe.
+     * Requires DHCP to be undefined - it is the only in-tree UDP user that
+     * indexes this without a bound check of its own. */
     struct tsocket udpsockets[MAX_UDPSOCKETS];
     struct tsocket icmpsockets[MAX_ICMPSOCKETS];
 #if WOLFIP_RAWSOCKETS
