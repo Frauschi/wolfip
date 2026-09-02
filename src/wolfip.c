@@ -8510,6 +8510,11 @@ static void icmp_input(struct wolfIP *s, unsigned int if_idx, struct wolfIP_ip_p
     icmp_try_recv(s, if_idx, icmp, len);
 }
 
+/* Opt-in on the same macro the in-tree ports already use to decide whether to
+ * CALL dhcp_client_init(), so a port enabling DHCP today keeps it. The dhcp_*
+ * fields stay in struct wolfIP either way, leaving the DHCP_IS_RUNNING() tests
+ * in the receive paths as runtime checks that are simply always false. */
+#ifdef DHCP
 static int dhcp_send_discover(struct wolfIP *s);
 static int dhcp_send_request(struct wolfIP *s);
 #ifdef ETHERNET
@@ -9607,6 +9612,7 @@ static void dhcp_dad_conflict(struct wolfIP *s)
     dhcp_send_discover(s);
 }
 #endif
+#endif /* DHCP */
 
 /* ARP */
 #ifdef ETHERNET
@@ -9855,6 +9861,7 @@ static void arp_request(struct wolfIP *s, unsigned int if_idx, ip4 tip)
  * reply is detected in arp_recv (dhcp_dad_conflict). Deliberately bypasses
  * the 1 req/s rate limit: DAD is at most 3 probes per acquisition, one
  * per second, and must not starve behind ordinary traffic. */
+#ifdef DHCP
 static int dhcp_send_dad_probe(struct wolfIP *s)
 {
     struct arp_packet arp;
@@ -9883,6 +9890,7 @@ static int dhcp_send_dad_probe(struct wolfIP *s)
     return wolfIP_ll_send_frame(s, WOLFIP_PRIMARY_IF_IDX, &arp,
                                 sizeof(struct arp_packet));
 }
+#endif /* DHCP */
 
 static void arp_recv(struct wolfIP *s, unsigned int if_idx, void *buf, int len)
 {
@@ -9941,6 +9949,7 @@ static void arp_recv(struct wolfIP *s, unsigned int if_idx, void *buf, int len)
     else if (arp->opcode == ee16(ARP_REPLY)) {
         ip4 sip = ee32(arp->sip);
         int pending;
+#ifdef DHCP
         /* RFC 4331 DAD: a reply claiming the address being probed means
          * it is in use, unless it came from our own MAC (looped probe).
          * This is the one case where a reply for our own IP is acted on. */
@@ -9949,6 +9958,7 @@ static void arp_recv(struct wolfIP *s, unsigned int if_idx, void *buf, int len)
                 dhcp_dad_conflict(s);
             return;
         }
+#endif /* DHCP */
         /* Validate sender IP: reject broadcast, multicast, zero, and
          * our own address -- same checks as the ARP request handler. */
         if (sip == IPADDR_ANY || sip == conf->ip ||
