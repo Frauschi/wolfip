@@ -72,6 +72,22 @@ typedef unsigned long size_t;
 #endif
 #endif
 
+#ifndef WOLFIP_SO_RCVTIMEO
+#ifdef SO_RCVTIMEO
+#define WOLFIP_SO_RCVTIMEO SO_RCVTIMEO
+#else
+#define WOLFIP_SO_RCVTIMEO 20
+#endif
+#endif
+
+#ifndef WOLFIP_SO_SNDTIMEO
+#ifdef SO_SNDTIMEO
+#define WOLFIP_SO_SNDTIMEO SO_SNDTIMEO
+#else
+#define WOLFIP_SO_SNDTIMEO 21
+#endif
+#endif
+
 #ifndef WOLFIP_SO_DONTROUTE
 #ifdef SO_DONTROUTE
 #define WOLFIP_SO_DONTROUTE SO_DONTROUTE
@@ -349,6 +365,15 @@ struct wolfIP_sockaddr_in {
 };
 struct wolfIP_sockaddr { uint16_t sa_family; };
 typedef uint32_t socklen_t;
+
+/* Timeout argument for SO_RCVTIMEO / SO_SNDTIMEO. Field names and semantics
+ * match POSIX struct timeval, including "all zero means no timeout", so a
+ * caller on a hosted platform can pass one of those instead where the two
+ * layouts agree. Declared here because wolfIP must not depend on sys/time.h. */
+struct wolfIP_timeval {
+    long tv_sec;
+    long tv_usec;
+};
 
 /* Pull in the system socket types when available, but only declare
  * WOLFIP_HAVE_POSIX_TYPES once BOTH <sys/socket.h> AND <sys/uio.h> are
