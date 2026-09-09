@@ -228,6 +228,11 @@ static void wolfip_bsd_fd_free(int public_fd)
  * peer that sends SYN and disappears. */
 #ifndef WOLFIP_BSD_ACCEPT_ESTABLISH_TICKS
 #define WOLFIP_BSD_ACCEPT_ESTABLISH_TICKS (pdMS_TO_TICKS(2000))
+
+/* How long close() waits for the peer to finish the FIN exchange before it
+ * gives up the wrapper slot. SO_SNDTIMEO overrides it: a caller that has said
+ * how long it will wait on this socket means it for the close too. */
+#define WOLFIP_BSD_CLOSE_LINGER_TICKS (pdMS_TO_TICKS(2000))
 #endif
 
 static void wolfip_bsd_socket_cb(int internal_fd, uint16_t events, void *arg)
@@ -830,13 +835,22 @@ int close(int sockfd)
 {
     int ret;
     wolfip_bsd_fd_entry *entry;
+    TickType_t linger;
+    TickType_t start;
 
     if (!wolfip_bsd_fd_valid(sockfd)) {
         return -1;
     }
     entry = &g_fds[sockfd];
 
+    linger = (entry->tx_timeout != portMAX_DELAY) ? entry->tx_timeout
+                                                  : WOLFIP_BSD_CLOSE_LINGER_TICKS;
+    start = xTaskGetTickCount();
+
     for (;;) {
+        uint16_t   closed_seen;
+        TickType_t elapsed;
+
         xSemaphoreTake(g_lock, portMAX_DELAY);
         ret = wolfIP_sock_close(g_ipstack, entry->internal_fd);
         if (ret >= 0) {
@@ -863,11 +877,37 @@ int close(int sockfd)
             return -1;
         }
 
+        /* CB_EVENT_CLOSED may already have been delivered - the peer can go
+         * away mid-session, long before this call. prepare_wait() clears
+         * seen_events, so blocking on it here would sleep for an event that
+         * has already happened and will not repeat. Retry instead, giving
+         * wolfIP_poll a turn to retire the socket. */
+        closed_seen = (uint16_t)(entry->seen_events & CB_EVENT_CLOSED);
         wolfip_bsd_prepare_wait_locked(entry, CB_EVENT_CLOSED);
         xSemaphoreGive(g_lock);
-        if (wolfip_bsd_wait_unlocked(entry, portMAX_DELAY) < 0) {
-            wolfip_bsd_set_error(WOLFIP_EAGAIN);
-            return -1;
+
+        elapsed = (TickType_t)(xTaskGetTickCount() - start);
+        if (elapsed < linger) {
+            if (closed_seen != 0u) {
+                vTaskDelay(1);
+                continue;
+            }
+            if (wolfip_bsd_wait_unlocked(entry, linger - elapsed) == 0) {
+                continue;
+            }
         }
+
+        /* The peer is not going to finish, so stop asking politely and abort:
+         * RST it and release the slot now. Waiting here for ever trades one
+         * dead peer for the whole calling task, and merely abandoning the
+         * descriptor trades it for a socket - which on a build with a handful
+         * of static sockets is the same outage one connection later. */
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+        (void)wolfIP_sock_abort(g_ipstack, entry->internal_fd);
+        wolfIP_register_callback(g_ipstack, entry->internal_fd, NULL, NULL);
+        wolfip_bsd_fd_free(sockfd);
+        xSemaphoreGive(g_lock);
+        wolfip_bsd_kick();      /* the RST still has to go out */
+        return 0;
     }
 }

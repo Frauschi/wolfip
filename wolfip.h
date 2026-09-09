@@ -508,6 +508,11 @@ int wolfIP_sock_getsockopt(struct wolfIP *s, int sockfd, int level, int optname,
                            void *optval, socklen_t *optlen);
 int wolfIP_sock_read(struct wolfIP *s, int sockfd, void *buf, size_t len);
 int wolfIP_sock_close(struct wolfIP *s, int sockfd);
+
+/* Abortive close (SO_LINGER(0)): send an RST and release the socket at once,
+ * rather than waiting on a FIN exchange the peer may never complete. Returns 0
+ * on success. Use when a stalled peer must not keep a static socket slot. */
+int wolfIP_sock_abort(struct wolfIP *s, int sockfd);
 int wolfIP_sock_getpeername(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *addr,
                             const socklen_t *addrlen);
 int wolfIP_sock_getsockname(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *addr,

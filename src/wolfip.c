@@ -8022,6 +8022,35 @@ int wolfIP_sock_close(struct wolfIP *s, int sockfd)
     return 0;
 }
 
+/* Abortive close: RST the peer and release the slot now, instead of waiting
+ * for a FIN exchange the peer may never finish. This is SO_LINGER(0), and it
+ * exists because the graceful path can stall for ever - a peer that stops
+ * reading leaves the FIN unsendable, and on a stack with a handful of static
+ * sockets one such corpse is the difference between serving and refusing. */
+int wolfIP_sock_abort(struct wolfIP *s, int sockfd)
+{
+    struct tsocket *ts;
+
+    if (!s || sockfd < 0 || !IS_SOCKET_TCP(sockfd))
+        return -WOLFIP_EINVAL;
+    if (SOCKET_UNMARK(sockfd) >= MAX_TCPSOCKETS)
+        return -WOLFIP_EINVAL;
+    ts = &s->tcpsockets[SOCKET_UNMARK(sockfd)];
+    if (ts->sock.tcp.state == TCP_CLOSED)
+        return 0;
+    /* A listener has no peer to inform; everything else may. */
+    if (ts->sock.tcp.state != TCP_LISTEN)
+        (void)tcp_send_reset_now(ts);
+    ts->sock.tcp.state = TCP_CLOSED;
+    (void)wolfIP_filter_notify_socket_event(
+        WOLFIP_FILT_CLOSED, s, ts,
+        ts->local_ip, ts->src_port, ts->remote_ip, ts->dst_port);
+    ts->callback = NULL;
+    ts->callback_arg = NULL;
+    close_socket(ts);
+    return 0;
+}
+
 int wolfIP_sock_getsockname(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *addr,
                             const socklen_t *addrlen)
 {
