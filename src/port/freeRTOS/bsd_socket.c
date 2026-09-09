@@ -469,19 +469,32 @@ int accept(int sockfd, struct wolfIP_sockaddr *addr, socklen_t *addrlen)
             {
                 unsigned spins;
                 int      st = 0;
+                int      readable = 0;
 
                 for (spins = 0; spins < WOLFIP_BSD_ACCEPT_ESTABLISH_TICKS;
                      spins++) {
                     xSemaphoreTake(g_lock, portMAX_DELAY);
                     st = wolfIP_sock_is_connected(g_ipstack,
                             g_fds[public_fd].internal_fd);
+                    readable = wolfIP_sock_can_read(g_ipstack,
+                            g_fds[public_fd].internal_fd);
                     xSemaphoreGive(g_lock);
-                    if (st != 0) {
+                    if ((st != 0) || (readable > 0)) {
                         break;
                     }
                     vTaskDelay(1);
                 }
-                if (st != 1) {
+                /* Readable counts as usable, not just established.
+                 *
+                 * A peer that writes and closes in one breath - nc, or
+                 * anything that sends a request and shuts down its write side
+                 * - can deliver its data and its FIN before this runs. The
+                 * socket is then in CLOSE_WAIT, which is_connected() reports
+                 * as -1 because it is not a new connection; dropping it here
+                 * threw away bytes the peer had successfully delivered and the
+                 * stack had acknowledged. POSIX says accept() hands that over:
+                 * the application reads the data, then end of stream. */
+                if ((st != 1) && (readable <= 0)) {
                     /* Never established, or died while we waited. Dropping it
                      * here rather than in the application keeps the failure
                      * where it belongs: accept() simply did not produce a
