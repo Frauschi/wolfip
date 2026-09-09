@@ -3730,6 +3730,35 @@ static void tcp_send_ack(struct tsocket *t)
         t->sock.tcp.ack_retry_pending = 0;
 }
 
+/* Send an RST on an established socket now, bypassing the TX FIFO. Callers
+ * that tear the socket down in the same breath cannot queue one: the teardown
+ * reinitialises the FIFO and the segment would never leave. Best effort - the
+ * socket is going away whether or not the peer can be reached. */
+static int tcp_send_reset_now(struct tsocket *t)
+{
+    struct wolfIP_tcp_seg *tcp;
+    uint8_t opt_len;
+    uint8_t buffer[sizeof(struct wolfIP_tcp_seg) + TCP_MAX_OPTIONS_LEN];
+    uint32_t frame_len;
+
+    if (!t)
+        return -WOLFIP_EINVAL;
+    tcp = (struct wolfIP_tcp_seg *)buffer;
+    memset(tcp, 0, sizeof(buffer));
+    opt_len = tcp_build_ack_options(t, tcp->data, TCP_MAX_OPTIONS_LEN);
+    tcp->src_port = ee16(t->src_port);
+    tcp->dst_port = ee16(t->dst_port);
+    tcp->seq = ee32(t->sock.tcp.seq);
+    tcp->ack = ee32(t->sock.tcp.ack);
+    tcp->hlen = ((20 + opt_len) << 2) & 0xF0;
+    tcp->flags = TCP_FLAG_RST | TCP_FLAG_ACK;
+    tcp->win = ee16(tcp_adv_win(t, 1));
+    tcp->csum = 0;
+    tcp->urg = 0;
+    frame_len = sizeof(struct wolfIP_tcp_seg) + opt_len;
+    return tcp_send_empty_immediate(t, tcp, frame_len);
+}
+
 static void tcp_send_reset_reply(struct wolfIP *s, unsigned int if_idx,
                                  const struct wolfIP_tcp_seg *in)
 {
@@ -5997,9 +6026,12 @@ static void tcp_rto_cb(void *arg)
             return;
         }
         /* The handshake completed but the application never accepted: an
-         * un-accepted established listener has no accept() path and no
-         * other timer, so the port would stay pinned forever. Revert to
-         * LISTEN; the peer's next segment gets the normal LISTEN RST. */
+         * un-accepted established listener has no accept() path and no other
+         * timer, so the port would stay pinned forever. The peer thinks it is
+         * connected and may have nothing left to send - a TLS client waiting
+         * for the server's first flight never does - so it would never draw
+         * the LISTEN RST. Tell it before reclaiming the port. */
+        (void)tcp_send_reset_now(ts);
         tcp_listener_revert_to_listen(ts);
         return;
     }
@@ -6672,7 +6704,10 @@ int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *add
             if (!newts) {
                 /* No socket free. Fall back to the old behaviour rather than
                  * leaving the port pinned in ESTABLISHED: the connection is
-                 * lost either way, but the listener stays usable. */
+                 * lost either way, but the listener stays usable. RST it so
+                 * the peer fails now instead of waiting on a server that has
+                 * already thrown its connection away. */
+                (void)tcp_send_reset_now(ts);
                 tcp_listener_revert_to_listen(ts);
                 return -1;
             }
