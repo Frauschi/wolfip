@@ -6844,6 +6844,13 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
             return -WOLFIP_EINVAL;
 
         ts = &s->tcpsockets[SOCKET_UNMARK(sockfd)];
+        if (ts->sock.tcp.state == TCP_SYN_SENT ||
+                ts->sock.tcp.state == TCP_SYN_RCVD)
+            /* Still connecting - retryable, not a failure. See the matching
+             * case in wolfIP_sock_recvfrom(). Deliberately NOT extended to the
+             * closing states below: a caller told to retry on a socket that is
+             * never coming back would spin for ever. */
+            return -WOLFIP_EAGAIN;
         if (ts->sock.tcp.state != TCP_ESTABLISHED &&
                 ts->sock.tcp.state != TCP_CLOSE_WAIT)
             return -1;
@@ -7279,7 +7286,15 @@ int wolfIP_sock_recvfrom(struct wolfIP *s, int sockfd, void *buf, size_t len, in
             if (queue_len(&ts->sock.tcp.rxbuf) == 0)
                 return 0;
             return queue_pop(&ts->sock.tcp.rxbuf, buf, len);
-        } else { /* Not established (LISTEN / SYN_SENT / SYN_RCVD / closing) */
+        } else if (ts->sock.tcp.state == TCP_SYN_SENT ||
+                ts->sock.tcp.state == TCP_SYN_RCVD) {
+            /* Connecting, not failed. A socket just out of accept() is
+             * legitimately still in SYN_RCVD, so this has to be
+             * distinguishable from a real error: a caller cannot otherwise
+             * tell "wait" from "give up", and a non-blocking TLS server that
+             * treats it as fatal fails every handshake. */
+            return -WOLFIP_EAGAIN;
+        } else { /* LISTEN, or a closing state with nothing left to read */
             return -1;
         }
     } else if (IS_SOCKET_UDP(sockfd)) {

@@ -475,6 +475,23 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
 int wolfIP_sock_send(struct wolfIP *s, int sockfd, const void *buf, size_t len,
                      int flags);
 int wolfIP_sock_write(struct wolfIP *s, int sockfd, const void *buf, size_t len);
+/* Return contract for the socket send/receive calls below.
+ *
+ *   > 0                bytes transferred (may be fewer than requested)
+ *   0                  end of stream (peer closed and nothing left to read)
+ *   -WOLFIP_EAGAIN     try again: no data queued, no transmit space, or the
+ *                      socket is still connecting (SYN_SENT / SYN_RCVD). A
+ *                      socket returned by accept() is legitimately in
+ *                      SYN_RCVD, so a caller MUST treat this as "wait", not
+ *                      as failure.
+ *   -WOLFIP_EINVAL     bad descriptor or bad arguments
+ *   -1                 the operation cannot succeed on this socket
+ *
+ * wolfIP never blocks; every call here can return -WOLFIP_EAGAIN, and callers
+ * are expected to poll. Note wolfIP_sock_close() shares this convention: on an
+ * established socket it starts the FIN exchange and returns -WOLFIP_EAGAIN
+ * WITHOUT releasing the descriptor, so it must be called again until it
+ * returns something else. */
 int wolfIP_sock_recvfrom(struct wolfIP *s, int sockfd, void *buf, size_t len,
                          int flags, struct wolfIP_sockaddr *src_addr, socklen_t *addrlen);
 int wolfIP_sock_recv(struct wolfIP *s, int sockfd, void *buf, size_t len, int flags);

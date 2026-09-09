@@ -277,7 +277,13 @@ static int wolfip_bsd_wait_unlocked(wolfip_bsd_fd_entry *entry,
 /* Some TCP core calls surface a temporary "not established yet" as -1 on a
  * freshly accepted stream socket before the final ACK promotes it to
  * ESTABLISHED. Allow a single wait/retry for that case without turning all
- * bare -1 returns into infinite retry loops. */
+ * bare -1 returns into infinite retry loops.
+ *
+ * NOW REDUNDANT, and kept only until it can be retested on hardware. The core
+ * reports SYN_SENT/SYN_RCVD as -WOLFIP_EAGAIN, which the callers below already
+ * wait on, so the -1 this exists to catch no longer occurs for that reason.
+ * Removing it should be a no-op; "should be" is not "is", and this shim is
+ * carrying a silicon-validated TLS server. */
 static int wolfip_bsd_tcp_stream_retryable_once(int internal_fd, int ret, int *used)
 {
     if (ret != -1 || used == NULL || *used || !IS_SOCKET_TCP(internal_fd)) {
