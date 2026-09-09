@@ -6676,9 +6676,20 @@ int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *add
         if (SOCKET_UNMARK(sockfd) >= MAX_TCPSOCKETS)
             return -WOLFIP_EINVAL;
         ts = &s->tcpsockets[SOCKET_UNMARK(sockfd)];
-        if (ts->sock.tcp.state == TCP_ESTABLISHED &&
+        if ((ts->sock.tcp.state == TCP_ESTABLISHED ||
+             ts->sock.tcp.state == TCP_CLOSE_WAIT) &&
                 ts->sock.tcp.is_listener) {
             /* The handshake completed before accept() was called.
+             *
+             * CLOSE_WAIT as well as ESTABLISHED, because a peer that writes
+             * and closes in one breath - nc does, and so does anything that
+             * sends a request and shuts down its write side - can complete
+             * the handshake, deliver its data and send its FIN before the
+             * application gets round to accepting. That left the listener in
+             * CLOSE_WAIT, which accept() did not recognise: it returned -1
+             * for ever, the queued data was unreachable, and the port stopped
+             * answering. Cloning it hands the caller the bytes and then the
+             * end of stream, which is what a socket API is supposed to do.
              *
              * This is an ordinary race, not an exotic one: the stack finishes
              * the handshake from its own context, so any application that is
@@ -6735,10 +6746,14 @@ int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *add
             newts->sock.tcp.txbuf.data = newts->txmem;
 
             /* The connection is established, so it is writable immediately -
-             * and readable if the peer's data beat accept() here too. */
+             * and readable if the peer's data beat accept() here too. A clone
+             * taken in CLOSE_WAIT must also report the close, or a consumer
+             * waiting on it would never learn the stream had ended. */
             newts->events = CB_EVENT_WRITABLE;
             if (queue_len(&newts->sock.tcp.rxbuf) > 0)
                 newts->events |= CB_EVENT_READABLE;
+            if (newts->sock.tcp.state == TCP_CLOSE_WAIT)
+                newts->events |= CB_EVENT_READABLE | CB_EVENT_CLOSED;
 
             /* Fill the peer address before reverting the listener: the revert
              * clears remote_ip and dst_port. */

@@ -298,9 +298,17 @@ static int wolfip_bsd_tcp_stream_retryable_once(int internal_fd, int ret, int *u
     return 1;
 }
 
+/* Distinguish "nothing yet" from a real answer on a TCP stream.
+ *
+ * Zero as well as -1, because the core reports an empty receive queue on an
+ * ESTABLISHED socket as 0 - indistinguishable at this level from end of
+ * stream. Returning that to the caller invents an EOF, and a peer that
+ * connects and sends a moment later loses its first message: the server sees
+ * the stream close before the bytes arrive. can_read() is the discriminator,
+ * since it advertises a genuinely closed socket as readable. */
 static int wolfip_bsd_tcp_recv_should_wait_locked(int internal_fd, int ret)
 {
-    if (ret != -1 || !IS_SOCKET_TCP(internal_fd)) {
+    if (((ret != -1) && (ret != 0)) || !IS_SOCKET_TCP(internal_fd)) {
         return 0;
     }
     return wolfIP_sock_can_read(g_ipstack, internal_fd) == 0;
@@ -650,7 +658,7 @@ int recv(int sockfd, void *buf, size_t len, int flags)
     for (;;) {
         xSemaphoreTake(g_lock, portMAX_DELAY);
         ret = wolfIP_sock_recv(g_ipstack, entry->internal_fd, buf, len, flags);
-        if (ret >= 0) {
+        if (ret > 0) {
             xSemaphoreGive(g_lock);
             return ret;
         }
@@ -663,6 +671,11 @@ int recv(int sockfd, void *buf, size_t len, int flags)
                 return -1;
             }
             continue;
+        }
+        if (ret == 0) {
+            /* Not spurious - the check above says the stream really is done. */
+            xSemaphoreGive(g_lock);
+            return 0;
         }
         if (ret != -WOLFIP_EAGAIN) {
             xSemaphoreGive(g_lock);
@@ -693,7 +706,7 @@ int recvfrom(int sockfd, void *buf, size_t len, int flags,
     for (;;) {
         xSemaphoreTake(g_lock, portMAX_DELAY);
         ret = wolfIP_sock_recvfrom(g_ipstack, entry->internal_fd, buf, len, flags, src_addr, addrlen);
-        if (ret >= 0) {
+        if (ret > 0) {
             xSemaphoreGive(g_lock);
             return ret;
         }
@@ -706,6 +719,11 @@ int recvfrom(int sockfd, void *buf, size_t len, int flags,
                 return -1;
             }
             continue;
+        }
+        if (ret == 0) {
+            /* Not spurious - the check above says the stream really is done. */
+            xSemaphoreGive(g_lock);
+            return 0;
         }
         if (ret != -WOLFIP_EAGAIN) {
             xSemaphoreGive(g_lock);
