@@ -518,6 +518,11 @@ int wolfIP_sock_getpeername(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr
 int wolfIP_sock_getsockname(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *addr,
                             const socklen_t *addrlen);
 int wolfIP_sock_can_read(struct wolfIP *s, int sockfd);
+
+/* Diagnostic census of the TCP socket table: fills counts[] (indexed by
+ * internal tcp_state, needs 11 entries) and returns how many sockets are
+ * allocated. For telling "the listener died" apart from "the pool ran dry". */
+int wolfIP_tcp_census(struct wolfIP *s, uint8_t *counts, unsigned n);
 int wolfIP_sock_can_write(struct wolfIP *s, int sockfd);
 
 int dhcp_client_init(struct wolfIP *s);

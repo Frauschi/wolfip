@@ -6030,13 +6030,23 @@ static void tcp_rto_cb(void *arg)
         return;
     }
     if (ts->sock.tcp.preaccept_timeout_active) {
-        if (ts->sock.tcp.state != TCP_ESTABLISHED ||
+        if ((ts->sock.tcp.state != TCP_ESTABLISHED &&
+             ts->sock.tcp.state != TCP_CLOSE_WAIT) ||
                 !ts->sock.tcp.is_listener) {
             /* The socket left the pinned condition (accepted away, reset,
              * or closed): disarm quietly. */
             tcp_preaccept_timeout_stop(ts);
             return;
         }
+        /* CLOSE_WAIT is still pinned, not "left the condition". A peer that
+         * connects and closes without waiting - anything that writes and
+         * shuts down its write side - takes an un-accepted listener straight
+         * from ESTABLISHED to CLOSE_WAIT. Disarming there left the listener
+         * parked in CLOSE_WAIT with nothing to rescue it: the port answered
+         * every later SYN with an RST, for ever. It cost a plaintext echo
+         * server that had a client busy at the wrong moment, and looked like
+         * socket exhaustion until the TLS server on the same board kept
+         * accepting, which proved the pool was fine. */
         /* The handshake completed but the application never accepted: an
          * un-accepted established listener has no accept() path and no other
          * timer, so the port would stay pinned forever. The peer thinks it is
@@ -8141,6 +8151,30 @@ int wolfIP_sock_getsockname(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr
     }
 #endif
     return -1;
+}
+
+/* Diagnostic: how many TCP sockets are allocated, and in which states.
+ * counts[] must hold TCP_LAST_ACK + 1 entries and is indexed by enum
+ * tcp_state. Returns the number of allocated sockets, or a negative error.
+ * Exists because "the port stopped answering" is indistinguishable from the
+ * outside whether the listener died or the pool ran dry. */
+int wolfIP_tcp_census(struct wolfIP *s, uint8_t *counts, unsigned n)
+{
+    unsigned i;
+    int      used = 0;
+
+    if (!s || !counts || n < (unsigned)(TCP_LAST_ACK + 1))
+        return -WOLFIP_EINVAL;
+    for (i = 0; i < n; i++)
+        counts[i] = 0;
+    for (i = 0; i < MAX_TCPSOCKETS; i++) {
+        struct tsocket *t = &s->tcpsockets[i];
+        if (t->proto == 0)
+            continue;
+        used++;
+        counts[(unsigned)t->sock.tcp.state]++;
+    }
+    return used;
 }
 
 int wolfIP_sock_can_read(struct wolfIP *s, int sockfd)
