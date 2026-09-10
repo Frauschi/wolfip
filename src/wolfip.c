@@ -5693,6 +5693,18 @@ static void tcp_input(struct wolfIP *S, unsigned int if_idx,
                 (void)wolfIP_filter_notify_socket_event(
                     WOLFIP_FILT_REMOTE_RESET, S, t,
                     t->local_ip, t->src_port, t->remote_ip, t->dst_port);
+                if (t->sock.tcp.is_listener) {
+                    /* Still the listening socket: it completed a handshake
+                     * before the application accepted, so it is carrying a
+                     * connection while remaining the only thing bound to the
+                     * port. close_socket() here destroyed it, and the service
+                     * never answered again - one peer that connected and sent
+                     * RST instead of FIN took the port down for good. The
+                     * SYN_RCVD case above already reverts for this reason;
+                     * this is the same socket one state later. */
+                    tcp_listener_revert_to_listen(t);
+                    continue;
+                }
                 close_socket(t);
                 continue;
             }
